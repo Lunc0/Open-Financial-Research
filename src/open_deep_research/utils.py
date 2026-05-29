@@ -1,4 +1,4 @@
-"""Utility functions and helpers for the Deep Research agent."""
+"""Deep Research 智能体的工具函数与辅助逻辑。"""
 
 import asyncio
 import logging
@@ -34,7 +34,7 @@ from open_deep_research.prompts import summarize_webpage_prompt
 from open_deep_research.state import ResearchComplete, Summary
 
 ##########################
-# Tavily Search Tool Utils
+# Tavily 搜索工具辅助函数
 ##########################
 TAVILY_SEARCH_DESCRIPTION = (
     "A search engine optimized for comprehensive, accurate, and trusted results. "
@@ -47,18 +47,18 @@ async def tavily_search(
     topic: Annotated[Literal["general", "news", "finance"], InjectedToolArg] = "general",
     config: RunnableConfig = None
 ) -> str:
-    """Fetch and summarize search results from Tavily search API.
+    """从 Tavily 搜索 API 获取并总结搜索结果。
 
-    Args:
-        queries: List of search queries to execute
-        max_results: Maximum number of results to return per query
-        topic: Topic filter for search results (general, news, or finance)
-        config: Runtime configuration for API keys and model settings
+    参数:
+        queries: 要执行的搜索查询列表
+        max_results: 每个查询返回的最大结果数
+        topic: 搜索结果的主题过滤器（general、news 或 finance）
+        config: 运行时配置，包含 API Key 和模型设置
 
-    Returns:
-        Formatted string containing summarized search results
+    返回:
+        包含摘要搜索结果的格式化字符串
     """
-    # Step 1: Execute search queries asynchronously
+    # 第 1 步：异步执行搜索查询
     search_results = await tavily_search_async(
         queries,
         max_results=max_results,
@@ -67,7 +67,7 @@ async def tavily_search(
         config=config
     )
     
-    # Step 2: Deduplicate results by URL to avoid processing the same content multiple times
+    # 第 2 步：按 URL 去重，避免重复处理相同内容
     unique_results = {}
     for response in search_results:
         for result in response['results']:
@@ -75,13 +75,13 @@ async def tavily_search(
             if url not in unique_results:
                 unique_results[url] = {**result, "query": response['query']}
     
-    # Step 3: Set up the summarization model with configuration
+    # 第 3 步：根据配置初始化摘要模型
     configurable = Configuration.from_runnable_config(config)
     
-    # Character limit to stay within model token limits (configurable)
+    # 字符上限，用于控制在模型 token 限制内（可配置）
     max_char_to_include = configurable.max_content_length
     
-    # Initialize summarization model with retry logic
+    # 初始化带重试逻辑的摘要模型
     model_api_key = get_api_key_for_model(configurable.summarization_model, config)
     summarization_model = init_chat_model(
         model=configurable.summarization_model,
@@ -92,9 +92,9 @@ async def tavily_search(
         stop_after_attempt=configurable.max_structured_output_retries
     )
     
-    # Step 4: Create summarization tasks (skip empty content)
+    # 第 4 步：创建摘要任务（跳过空内容）
     async def noop():
-        """No-op function for results without raw content."""
+        """用于无原始内容结果的空操作函数。"""
         return None
     
     summarization_tasks = [
@@ -106,10 +106,10 @@ async def tavily_search(
         for result in unique_results.values()
     ]
     
-    # Step 5: Execute all summarization tasks in parallel
+    # 第 5 步：并行执行所有摘要任务
     summaries = await asyncio.gather(*summarization_tasks)
     
-    # Step 6: Combine results with their summaries
+    # 第 6 步：将结果与对应摘要合并
     summarized_results = {
         url: {
             'title': result['title'], 
@@ -122,7 +122,7 @@ async def tavily_search(
         )
     }
     
-    # Step 7: Format the final output
+    # 第 7 步：格式化最终输出
     if not summarized_results:
         return "No valid search results found. Please try different search queries or use a different search API."
     
@@ -142,22 +142,22 @@ async def tavily_search_async(
     include_raw_content: bool = True, 
     config: RunnableConfig = None
 ):
-    """Execute multiple Tavily search queries asynchronously.
+    """异步执行多个 Tavily 搜索查询。
     
-    Args:
-        search_queries: List of search query strings to execute
-        max_results: Maximum number of results per query
-        topic: Topic category for filtering results
-        include_raw_content: Whether to include full webpage content
-        config: Runtime configuration for API key access
+    参数:
+        search_queries: 要执行的搜索查询字符串列表
+        max_results: 每个查询的最大结果数
+        topic: 结果过滤的主题类别
+        include_raw_content: 是否包含网页完整内容
+        config: 用于获取 API Key 的运行时配置
         
-    Returns:
-        List of search result dictionaries from Tavily API
+    返回:
+        来自 Tavily API 的搜索结果字典列表
     """
-    # Initialize the Tavily client with API key from config
+    # 使用配置中的 API Key 初始化 Tavily 客户端
     tavily_client = AsyncTavilyClient(api_key=get_tavily_api_key(config))
     
-    # Create search tasks for parallel execution
+    # 创建并行执行的搜索任务
     search_tasks = [
         tavily_client.search(
             query,
@@ -168,34 +168,34 @@ async def tavily_search_async(
         for query in search_queries
     ]
     
-    # Execute all search queries in parallel and return results
+    # 并行执行所有搜索查询并返回结果
     search_results = await asyncio.gather(*search_tasks)
     return search_results
 
 async def summarize_webpage(model: BaseChatModel, webpage_content: str) -> str:
-    """Summarize webpage content using AI model with timeout protection.
+    """使用 AI 模型对网页内容进行摘要，并带有超时保护。
     
-    Args:
-        model: The chat model configured for summarization
-        webpage_content: Raw webpage content to be summarized
+    参数:
+        model: 用于摘要的聊天模型
+        webpage_content: 待摘要的网页原始内容
         
-    Returns:
-        Formatted summary with key excerpts, or original content if summarization fails
+    返回:
+        带关键摘录的格式化摘要；若摘要失败则返回原始内容
     """
     try:
-        # Create prompt with current date context
+        # 构造带当前日期上下文的提示词
         prompt_content = summarize_webpage_prompt.format(
             webpage_content=webpage_content, 
             date=get_today_str()
         )
         
-        # Execute summarization with timeout to prevent hanging
+        # 执行带超时限制的摘要，避免任务卡住
         summary = await asyncio.wait_for(
             model.ainvoke([HumanMessage(content=prompt_content)]),
-            timeout=60.0  # 60 second timeout for summarization
+            timeout=60.0  # 摘要超时时间为 60 秒
         )
         
-        # Format the summary with structured sections
+        # 将摘要整理为结构化格式
         formatted_summary = (
             f"<summary>\n{summary.summary}\n</summary>\n\n"
             f"<key_excerpts>\n{summary.key_excerpts}\n</key_excerpts>"
@@ -204,64 +204,64 @@ async def summarize_webpage(model: BaseChatModel, webpage_content: str) -> str:
         return formatted_summary
         
     except asyncio.TimeoutError:
-        # Timeout during summarization - return original content
+        # 摘要超时，返回原始内容
         logging.warning("Summarization timed out after 60 seconds, returning original content")
         return webpage_content
     except Exception as e:
-        # Other errors during summarization - log and return original content
+        # 其他摘要错误，记录日志并返回原始内容
         logging.warning(f"Summarization failed with error: {str(e)}, returning original content")
         return webpage_content
 
 ##########################
-# Reflection Tool Utils
+# 反思工具辅助函数
 ##########################
 
 @tool(description="Strategic reflection tool for research planning")
 def think_tool(reflection: str) -> str:
-    """Tool for strategic reflection on research progress and decision-making.
+    """用于研究进展与决策的策略反思工具。
 
-    Use this tool after each search to analyze results and plan next steps systematically.
-    This creates a deliberate pause in the research workflow for quality decision-making.
+    在每次搜索后使用该工具，系统性分析结果并规划下一步。
+    这会在研究流程中加入一次有意识的停顿，以提升决策质量。
 
-    When to use:
-    - After receiving search results: What key information did I find?
-    - Before deciding next steps: Do I have enough to answer comprehensively?
-    - When assessing research gaps: What specific information am I still missing?
-    - Before concluding research: Can I provide a complete answer now?
+    使用时机：
+    - 收到搜索结果后：我找到了哪些关键信息？
+    - 决定下一步之前：现有信息是否足够完整回答问题？
+    - 评估研究缺口时：我还缺哪些具体信息？
+    - 准备结束研究前：我现在是否能给出完整答案？
 
-    Reflection should address:
-    1. Analysis of current findings - What concrete information have I gathered?
-    2. Gap assessment - What crucial information is still missing?
-    3. Quality evaluation - Do I have sufficient evidence/examples for a good answer?
-    4. Strategic decision - Should I continue searching or provide my answer?
+    反思内容应包括：
+    1. 当前发现分析：我已经掌握了哪些具体信息？
+    2. 缺口评估：还缺少哪些关键信息？
+    3. 质量评估：我是否已有足够证据或例子支撑一个好答案？
+    4. 策略决策：应继续搜索还是直接给出答案？
 
-    Args:
-        reflection: Your detailed reflection on research progress, findings, gaps, and next steps
+    参数:
+        reflection: 你对研究进展、发现、缺口和下一步的详细反思
 
-    Returns:
-        Confirmation that reflection was recorded for decision-making
+    返回:
+        一条确认反思已被记录、可用于决策的信息
     """
     return f"Reflection recorded: {reflection}"
 
 ##########################
-# MCP Utils
+# MCP 辅助函数
 ##########################
 
 async def get_mcp_access_token(
     supabase_token: str,
     base_mcp_url: str,
 ) -> Optional[Dict[str, Any]]:
-    """Exchange Supabase token for MCP access token using OAuth token exchange.
+    """通过 OAuth token exchange 将 Supabase token 换成 MCP access token。
     
-    Args:
-        supabase_token: Valid Supabase authentication token
-        base_mcp_url: Base URL of the MCP server
+    参数:
+        supabase_token: 有效的 Supabase 身份验证 token
+        base_mcp_url: MCP 服务器的基础 URL
         
-    Returns:
-        Token data dictionary if successful, None if failed
+    返回:
+        成功时返回 token 数据字典，失败时返回 None
     """
     try:
-        # Prepare OAuth token exchange request data
+        # 准备 OAuth token exchange 请求数据
         form_data = {
             "client_id": "mcp_default",
             "subject_token": supabase_token,
@@ -270,18 +270,18 @@ async def get_mcp_access_token(
             "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
         }
         
-        # Execute token exchange request
+        # 执行 token exchange 请求
         async with aiohttp.ClientSession() as session:
             token_url = base_mcp_url.rstrip("/") + "/oauth/token"
             headers = {"Content-Type": "application/x-www-form-urlencoded"}
             
             async with session.post(token_url, headers=headers, data=form_data) as response:
                 if response.status == 200:
-                    # Successfully obtained token
+                    # 成功获取 token
                     token_data = await response.json()
                     return token_data
                 else:
-                    # Log error details for debugging
+                    # 记录错误细节，便于排查
                     response_text = await response.text()
                     logging.error(f"Token exchange failed: {response_text}")
                     
@@ -291,17 +291,17 @@ async def get_mcp_access_token(
     return None
 
 async def get_tokens(config: RunnableConfig):
-    """Retrieve stored authentication tokens with expiration validation.
+    """读取已存储的认证 token，并校验其是否过期。
     
-    Args:
-        config: Runtime configuration containing thread and user identifiers
+    参数:
+        config: 包含线程和用户标识的运行时配置
         
-    Returns:
-        Token dictionary if valid and not expired, None otherwise
+    返回:
+        若 token 有效且未过期则返回 token 字典，否则返回 None
     """
     store = get_store()
     
-    # Extract required identifiers from config
+    # 从配置中提取所需标识
     thread_id = config.get("configurable", {}).get("thread_id")
     if not thread_id:
         return None
@@ -310,34 +310,34 @@ async def get_tokens(config: RunnableConfig):
     if not user_id:
         return None
     
-    # Retrieve stored tokens
+    # 读取已存储的 token
     tokens = await store.aget((user_id, "tokens"), "data")
     if not tokens:
         return None
     
-    # Check token expiration
-    expires_in = tokens.value.get("expires_in")  # seconds until expiration
-    created_at = tokens.created_at  # datetime of token creation
+    # 检查 token 是否过期
+    expires_in = tokens.value.get("expires_in")  # 距离过期的秒数
+    created_at = tokens.created_at  # token 创建时间
     current_time = datetime.now(timezone.utc)
     expiration_time = created_at + timedelta(seconds=expires_in)
     
     if current_time > expiration_time:
-        # Token expired, clean up and return None
+        # token 已过期，清理后返回 None
         await store.adelete((user_id, "tokens"), "data")
         return None
 
     return tokens.value
 
 async def set_tokens(config: RunnableConfig, tokens: dict[str, Any]):
-    """Store authentication tokens in the configuration store.
+    """将认证 token 存入配置存储。
     
-    Args:
-        config: Runtime configuration containing thread and user identifiers
-        tokens: Token dictionary to store
+    参数:
+        config: 包含线程和用户标识的运行时配置
+        tokens: 要存储的 token 字典
     """
     store = get_store()
     
-    # Extract required identifiers from config
+    # 从配置中提取所需标识
     thread_id = config.get("configurable", {}).get("thread_id")
     if not thread_id:
         return
@@ -346,62 +346,62 @@ async def set_tokens(config: RunnableConfig, tokens: dict[str, Any]):
     if not user_id:
         return
     
-    # Store the tokens
+    # 存储 token
     await store.aput((user_id, "tokens"), "data", tokens)
 
 async def fetch_tokens(config: RunnableConfig) -> dict[str, Any]:
-    """Fetch and refresh MCP tokens, obtaining new ones if needed.
+    """获取并刷新 MCP token，必要时申请新 token。
     
-    Args:
-        config: Runtime configuration with authentication details
+    参数:
+        config: 含认证信息的运行时配置
         
-    Returns:
-        Valid token dictionary, or None if unable to obtain tokens
+    返回:
+        有效的 token 字典；若无法获取则返回 None
     """
-    # Try to get existing valid tokens first
+    # 优先尝试获取已有且仍有效的 token
     current_tokens = await get_tokens(config)
     if current_tokens:
         return current_tokens
     
-    # Extract Supabase token for new token exchange
+    # 提取用于换取新 token 的 Supabase token
     supabase_token = config.get("configurable", {}).get("x-supabase-access-token")
     if not supabase_token:
         return None
     
-    # Extract MCP configuration
+    # 提取 MCP 配置
     mcp_config = config.get("configurable", {}).get("mcp_config")
     if not mcp_config or not mcp_config.get("url"):
         return None
     
-    # Exchange Supabase token for MCP tokens
+    # 用 Supabase token 换取 MCP token
     mcp_tokens = await get_mcp_access_token(supabase_token, mcp_config.get("url"))
     if not mcp_tokens:
         return None
 
-    # Store the new tokens and return them
+    # 存储新 token 并返回
     await set_tokens(config, mcp_tokens)
     return mcp_tokens
 
 def wrap_mcp_authenticate_tool(tool: StructuredTool) -> StructuredTool:
-    """Wrap MCP tool with comprehensive authentication and error handling.
+    """为 MCP 工具包装认证与错误处理逻辑。
     
-    Args:
-        tool: The MCP structured tool to wrap
+    参数:
+        tool: 要包装的 MCP 结构化工具
         
-    Returns:
-        Enhanced tool with authentication error handling
+    返回:
+        增强后的工具，包含认证错误处理能力
     """
     original_coroutine = tool.coroutine
     
     async def authentication_wrapper(**kwargs):
-        """Enhanced coroutine with MCP error handling and user-friendly messages."""
+        """带 MCP 错误处理和用户友好提示的增强协程。"""
         
         def _find_mcp_error_in_exception_chain(exc: BaseException) -> McpError | None:
-            """Recursively search for MCP errors in exception chains."""
+            """递归地在异常链中查找 MCP 错误。"""
             if isinstance(exc, McpError):
                 return exc
             
-            # Handle ExceptionGroup (Python 3.11+) by checking attributes
+            # 通过检查属性处理 ExceptionGroup（Python 3.11+）
             if hasattr(exc, 'exceptions'):
                 for sub_exception in exc.exceptions:
                     if found_error := _find_mcp_error_in_exception_chain(sub_exception):
@@ -409,40 +409,40 @@ def wrap_mcp_authenticate_tool(tool: StructuredTool) -> StructuredTool:
             return None
         
         try:
-            # Execute the original tool functionality
+            # 执行原始工具逻辑
             return await original_coroutine(**kwargs)
             
         except BaseException as original_error:
-            # Search for MCP-specific errors in the exception chain
+            # 在异常链中查找 MCP 特有错误
             mcp_error = _find_mcp_error_in_exception_chain(original_error)
             if not mcp_error:
-                # Not an MCP error, re-raise the original exception
+                # 不是 MCP 错误，直接重新抛出原始异常
                 raise original_error
             
-            # Handle MCP-specific error cases
+            # 处理 MCP 特有的错误场景
             error_details = mcp_error.error
             error_code = getattr(error_details, "code", None)
             error_data = getattr(error_details, "data", None) or {}
             
-            # Check for authentication/interaction required error
-            if error_code == -32003:  # Interaction required error code
+            # 检查是否为需要认证/用户交互的错误
+            if error_code == -32003:  # 需要交互的错误码
                 message_payload = error_data.get("message", {})
                 error_message = "Required interaction"
                 
-                # Extract user-friendly message if available
+                # 如果有更友好的提示文本，则优先使用
                 if isinstance(message_payload, dict):
                     error_message = message_payload.get("text") or error_message
                 
-                # Append URL if provided for user reference
+                # 如果有 URL，则附加到消息中供用户参考
                 if url := error_data.get("url"):
                     error_message = f"{error_message} {url}"
                 
                 raise ToolException(error_message) from original_error
             
-            # For other MCP errors, re-raise the original
+            # 其他 MCP 错误仍然抛出原始异常
             raise original_error
     
-    # Replace the tool's coroutine with our enhanced version
+    # 用增强版本替换工具原有协程
     tool.coroutine = authentication_wrapper
     return tool
 
@@ -450,24 +450,24 @@ async def load_mcp_tools(
     config: RunnableConfig,
     existing_tool_names: set[str],
 ) -> list[BaseTool]:
-    """Load and configure MCP (Model Context Protocol) tools with authentication.
+    """加载并配置带认证能力的 MCP（Model Context Protocol）工具。
     
-    Args:
-        config: Runtime configuration containing MCP server details
-        existing_tool_names: Set of tool names already in use to avoid conflicts
+    参数:
+        config: 包含 MCP 服务器详情的运行时配置
+        existing_tool_names: 已在使用的工具名集合，用于避免冲突
         
-    Returns:
-        List of configured MCP tools ready for use
+    返回:
+        已配置完成、可直接使用的 MCP 工具列表
     """
     configurable = Configuration.from_runnable_config(config)
     
-    # Step 1: Handle authentication if required
+    # 第 1 步：如有需要，先处理认证
     if configurable.mcp_config and configurable.mcp_config.auth_required:
         mcp_tokens = await fetch_tokens(config)
     else:
         mcp_tokens = None
     
-    # Step 2: Validate configuration requirements
+    # 第 2 步：校验配置是否满足要求
     config_valid = (
         configurable.mcp_config and 
         configurable.mcp_config.url and 
@@ -478,10 +478,10 @@ async def load_mcp_tools(
     if not config_valid:
         return []
     
-    # Step 3: Set up MCP server connection
+    # 第 3 步：建立 MCP 服务器连接配置
     server_url = configurable.mcp_config.url.rstrip("/") + "/mcp"
     
-    # Configure authentication headers if tokens are available
+    # 若已拿到 token，则配置认证请求头
     auth_headers = None
     if mcp_tokens:
         auth_headers = {"Authorization": f"Bearer {mcp_tokens['access_token']}"}
@@ -493,31 +493,31 @@ async def load_mcp_tools(
             "transport": "streamable_http"
         }
     }
-    # TODO: When Multi-MCP Server support is merged in OAP, update this code
+    # TODO: 等 OAP 合入多 MCP 服务器支持后，更新这里的实现
     
-    # Step 4: Load tools from MCP server
+    # 第 4 步：从 MCP 服务器加载工具
     try:
         client = MultiServerMCPClient(mcp_server_config)
         available_mcp_tools = await client.get_tools()
     except Exception:
-        # If MCP server connection fails, return empty list
+        # MCP 服务器连接失败时返回空列表
         return []
     
-    # Step 5: Filter and configure tools
+    # 第 5 步：筛选并配置工具
     configured_tools = []
     for mcp_tool in available_mcp_tools:
-        # Skip tools with conflicting names
+        # 跳过名称冲突的工具
         if mcp_tool.name in existing_tool_names:
             warnings.warn(
                 f"MCP tool '{mcp_tool.name}' conflicts with existing tool name - skipping"
             )
             continue
         
-        # Only include tools specified in configuration
+        # 仅保留配置中明确指定的工具
         if mcp_tool.name not in set(configurable.mcp_config.tools):
             continue
         
-        # Wrap tool with authentication handling and add to list
+        # 为工具包装认证处理后加入结果列表
         enhanced_tool = wrap_mcp_authenticate_tool(mcp_tool)
         configured_tools.append(enhanced_tool)
     
@@ -525,20 +525,20 @@ async def load_mcp_tools(
 
 
 ##########################
-# Tool Utils
+# 工具装配辅助函数
 ##########################
 
 async def get_search_tool(search_api: SearchAPI):
-    """Configure and return search tools based on the specified API provider.
+    """根据指定的 API 提供方配置并返回搜索工具。
     
-    Args:
-        search_api: The search API provider to use (Anthropic, OpenAI, Tavily, or None)
+    参数:
+        search_api: 要使用的搜索 API 提供方（Anthropic、OpenAI、Tavily 或 None）
         
-    Returns:
-        List of configured search tool objects for the specified provider
+    返回:
+        为指定提供方配置好的搜索工具对象列表
     """
     if search_api == SearchAPI.ANTHROPIC:
-        # Anthropic's native web search with usage limits
+        # Anthropic 原生网页搜索，带使用次数限制
         return [{
             "type": "web_search_20250305", 
             "name": "web_search", 
@@ -546,11 +546,11 @@ async def get_search_tool(search_api: SearchAPI):
         }]
         
     elif search_api == SearchAPI.OPENAI:
-        # OpenAI's web search preview functionality
+        # OpenAI 的网页搜索预览功能
         return [{"type": "web_search_preview"}]
         
     elif search_api == SearchAPI.TAVILY:
-        # Configure Tavily search tool with metadata
+        # 为 Tavily 搜索工具补充元数据
         search_tool = tavily_search
         search_tool.metadata = {
             **(search_tool.metadata or {}), 
@@ -560,97 +560,97 @@ async def get_search_tool(search_api: SearchAPI):
         return [search_tool]
         
     elif search_api == SearchAPI.NONE:
-        # No search functionality configured
+        # 不配置搜索功能
         return []
         
-    # Default fallback for unknown search API types
+    # 未知搜索 API 类型的默认兜底
     return []
     
 async def get_all_tools(config: RunnableConfig):
-    """Assemble complete toolkit including research, search, and MCP tools.
+    """组装完整工具集，包含研究、搜索和 MCP 工具。
     
-    Args:
-        config: Runtime configuration specifying search API and MCP settings
+    参数:
+        config: 指定搜索 API 和 MCP 设置的运行时配置
         
-    Returns:
-        List of all configured and available tools for research operations
+    返回:
+        研究流程可用的全部已配置工具列表
     """
-    # Start with core research tools
+    # 先加入核心研究工具
     tools = [tool(ResearchComplete), think_tool]
     
-    # Add configured search tools
+    # 加入配置好的搜索工具
     configurable = Configuration.from_runnable_config(config)
     search_api = SearchAPI(get_config_value(configurable.search_api))
     search_tools = await get_search_tool(search_api)
     tools.extend(search_tools)
     
-    # Track existing tool names to prevent conflicts
+    # 记录现有工具名，防止命名冲突
     existing_tool_names = {
         tool.name if hasattr(tool, "name") else tool.get("name", "web_search") 
         for tool in tools
     }
     
-    # Add MCP tools if configured
+    # 如有配置则加入 MCP 工具
     mcp_tools = await load_mcp_tools(config, existing_tool_names)
     tools.extend(mcp_tools)
     
     return tools
 
 def get_notes_from_tool_calls(messages: list[MessageLikeRepresentation]):
-    """Extract notes from tool call messages."""
+    """从工具调用消息中提取笔记内容。"""
     return [tool_msg.content for tool_msg in filter_messages(messages, include_types="tool")]
 
 ##########################
-# Model Provider Native Websearch Utils
+# 模型提供方原生 Web Search 辅助函数
 ##########################
 
 def anthropic_websearch_called(response):
-    """Detect if Anthropic's native web search was used in the response.
+    """检测响应中是否使用了 Anthropic 的原生网页搜索。
     
-    Args:
-        response: The response object from Anthropic's API
+    参数:
+        response: Anthropic API 返回的响应对象
         
-    Returns:
-        True if web search was called, False otherwise
+    返回:
+        如果调用了网页搜索则返回 True，否则返回 False
     """
     try:
-        # Navigate through the response metadata structure
+        # 逐层读取响应元数据结构
         usage = response.response_metadata.get("usage")
         if not usage:
             return False
         
-        # Check for server-side tool usage information
+        # 检查服务端工具使用信息
         server_tool_use = usage.get("server_tool_use")
         if not server_tool_use:
             return False
         
-        # Look for web search request count
+        # 查找网页搜索请求次数
         web_search_requests = server_tool_use.get("web_search_requests")
         if web_search_requests is None:
             return False
         
-        # Return True if any web search requests were made
+        # 只要存在网页搜索请求即返回 True
         return web_search_requests > 0
         
     except (AttributeError, TypeError):
-        # Handle cases where response structure is unexpected
+        # 处理响应结构不符合预期的情况
         return False
 
 def openai_websearch_called(response):
-    """Detect if OpenAI's web search functionality was used in the response.
+    """检测响应中是否使用了 OpenAI 的网页搜索功能。
     
-    Args:
-        response: The response object from OpenAI's API
+    参数:
+        response: OpenAI API 返回的响应对象
         
-    Returns:
-        True if web search was called, False otherwise
+    返回:
+        如果调用了网页搜索则返回 True，否则返回 False
     """
-    # Check for tool outputs in the response metadata
+    # 检查响应元数据中的工具输出
     tool_outputs = response.additional_kwargs.get("tool_outputs")
     if not tool_outputs:
         return False
     
-    # Look for web search calls in the tool outputs
+    # 在工具输出中查找网页搜索调用
     for tool_output in tool_outputs:
         if tool_output.get("type") == "web_search_call":
             return True
@@ -659,22 +659,22 @@ def openai_websearch_called(response):
 
 
 ##########################
-# Token Limit Exceeded Utils
+# Token 超限辅助函数
 ##########################
 
 def is_token_limit_exceeded(exception: Exception, model_name: str = None) -> bool:
-    """Determine if an exception indicates a token/context limit was exceeded.
+    """判断异常是否表示 token/上下文长度已超限。
     
-    Args:
-        exception: The exception to analyze
-        model_name: Optional model name to optimize provider detection
+    参数:
+        exception: 要分析的异常对象
+        model_name: 可选的模型名称，用于优化提供方识别
         
-    Returns:
-        True if the exception indicates a token limit was exceeded, False otherwise
+    返回:
+        若异常表示 token 超限则返回 True，否则返回 False
     """
     error_str = str(exception).lower()
     
-    # Step 1: Determine provider from model name if available
+    # 第 1 步：如果提供了模型名，则先判断提供方
     provider = None
     if model_name:
         model_str = str(model_name).lower()
@@ -685,7 +685,7 @@ def is_token_limit_exceeded(exception: Exception, model_name: str = None) -> boo
         elif model_str.startswith('gemini:') or model_str.startswith('google:'):
             provider = 'gemini'
     
-    # Step 2: Check provider-specific token limit patterns
+    # 第 2 步：检查提供方特有的 token 超限模式
     if provider == 'openai':
         return _check_openai_token_limit(exception, error_str)
     elif provider == 'anthropic':
@@ -693,7 +693,7 @@ def is_token_limit_exceeded(exception: Exception, model_name: str = None) -> boo
     elif provider == 'gemini':
         return _check_gemini_token_limit(exception, error_str)
     
-    # Step 3: If provider unknown, check all providers
+    # 第 3 步：如果提供方未知，则检查所有提供方规则
     return (
         _check_openai_token_limit(exception, error_str) or
         _check_anthropic_token_limit(exception, error_str) or
@@ -701,28 +701,28 @@ def is_token_limit_exceeded(exception: Exception, model_name: str = None) -> boo
     )
 
 def _check_openai_token_limit(exception: Exception, error_str: str) -> bool:
-    """Check if exception indicates OpenAI token limit exceeded."""
-    # Analyze exception metadata
+    """检查异常是否表示 OpenAI token 超限。"""
+    # 分析异常元数据
     exception_type = str(type(exception))
     class_name = exception.__class__.__name__
     module_name = getattr(exception.__class__, '__module__', '')
     
-    # Check if this is an OpenAI exception
+    # 判断这是否是 OpenAI 异常
     is_openai_exception = (
         'openai' in exception_type.lower() or 
         'openai' in module_name.lower()
     )
     
-    # Check for typical OpenAI token limit error types
+    # 检查典型的 OpenAI token 超限错误类型
     is_request_error = class_name in ['BadRequestError', 'InvalidRequestError']
     
     if is_openai_exception and is_request_error:
-        # Look for token-related keywords in error message
+        # 在错误消息中查找与 token 相关的关键词
         token_keywords = ['token', 'context', 'length', 'maximum context', 'reduce']
         if any(keyword in error_str for keyword in token_keywords):
             return True
     
-    # Check for specific OpenAI error codes
+    # 检查 OpenAI 特定错误码
     if hasattr(exception, 'code') and hasattr(exception, 'type'):
         error_code = getattr(exception, 'code', '')
         error_type = getattr(exception, 'type', '')
@@ -734,42 +734,42 @@ def _check_openai_token_limit(exception: Exception, error_str: str) -> bool:
     return False
 
 def _check_anthropic_token_limit(exception: Exception, error_str: str) -> bool:
-    """Check if exception indicates Anthropic token limit exceeded."""
-    # Analyze exception metadata
+    """检查异常是否表示 Anthropic token 超限。"""
+    # 分析异常元数据
     exception_type = str(type(exception))
     class_name = exception.__class__.__name__
     module_name = getattr(exception.__class__, '__module__', '')
     
-    # Check if this is an Anthropic exception
+    # 判断这是否是 Anthropic 异常
     is_anthropic_exception = (
         'anthropic' in exception_type.lower() or 
         'anthropic' in module_name.lower()
     )
     
-    # Check for Anthropic-specific error patterns
+    # 检查 Anthropic 特有的错误模式
     is_bad_request = class_name == 'BadRequestError'
     
     if is_anthropic_exception and is_bad_request:
-        # Anthropic uses specific error messages for token limits
+        # Anthropic 对 token 超限使用特定错误消息
         if 'prompt is too long' in error_str:
             return True
     
     return False
 
 def _check_gemini_token_limit(exception: Exception, error_str: str) -> bool:
-    """Check if exception indicates Google/Gemini token limit exceeded."""
-    # Analyze exception metadata
+    """检查异常是否表示 Google/Gemini token 超限。"""
+    # 分析异常元数据
     exception_type = str(type(exception))
     class_name = exception.__class__.__name__
     module_name = getattr(exception.__class__, '__module__', '')
     
-    # Check if this is a Google/Gemini exception
+    # 判断这是否是 Google/Gemini 异常
     is_google_exception = (
         'google' in exception_type.lower() or 
         'google' in module_name.lower()
     )
     
-    # Check for Google-specific resource exhaustion errors
+    # 检查 Google 特有的资源耗尽错误
     is_resource_exhausted = class_name in [
         'ResourceExhausted', 
         'GoogleGenerativeAIFetchError'
@@ -778,13 +778,13 @@ def _check_gemini_token_limit(exception: Exception, error_str: str) -> bool:
     if is_google_exception and is_resource_exhausted:
         return True
     
-    # Check for specific Google API resource exhaustion patterns
+    # 检查 Google API 特定的资源耗尽模式
     if 'google.api_core.exceptions.resourceexhausted' in exception_type.lower():
         return True
     
     return False
 
-# NOTE: This may be out of date or not applicable to your models. Please update this as needed.
+# 注意：这里的数据可能已经过时，或不适用于你当前使用的模型，请按需更新。
 MODEL_TOKEN_LIMITS = {
     "openai:gpt-4.1-mini": 1047576,
     "openai:gpt-4.1-nano": 1047576,
@@ -829,57 +829,57 @@ MODEL_TOKEN_LIMITS = {
 }
 
 def get_model_token_limit(model_string):
-    """Look up the token limit for a specific model.
+    """查询指定模型的 token 上限。
     
-    Args:
-        model_string: The model identifier string to look up
+    参数:
+        model_string: 要查询的模型标识字符串
         
-    Returns:
-        Token limit as integer if found, None if model not in lookup table
+    返回:
+        若命中则返回整数形式的 token 上限，否则返回 None
     """
-    # Search through known model token limits
+    # 在已知模型 token 上限表中查找
     for model_key, token_limit in MODEL_TOKEN_LIMITS.items():
         if model_key in model_string:
             return token_limit
     
-    # Model not found in lookup table
+    # 查不到该模型时返回 None
     return None
 
 def remove_up_to_last_ai_message(messages: list[MessageLikeRepresentation]) -> list[MessageLikeRepresentation]:
-    """Truncate message history by removing up to the last AI message.
+    """通过删除最后一条 AI 消息之前的内容来截断消息历史。
     
-    This is useful for handling token limit exceeded errors by removing recent context.
+    这对处理 token 超限错误很有用，因为它能移除最近的一段上下文。
     
-    Args:
-        messages: List of message objects to truncate
+    参数:
+        messages: 需要截断的消息对象列表
         
-    Returns:
-        Truncated message list up to (but not including) the last AI message
+    返回:
+        截断后的消息列表，保留到最后一条 AI 消息之前（不含该消息）
     """
-    # Search backwards through messages to find the last AI message
+    # 从后往前查找最后一条 AI 消息
     for i in range(len(messages) - 1, -1, -1):
         if isinstance(messages[i], AIMessage):
-            # Return everything up to (but not including) the last AI message
+            # 返回最后一条 AI 消息之前的所有内容（不含该消息）
             return messages[:i]
     
-    # No AI messages found, return original list
+    # 未找到 AI 消息，返回原始列表
     return messages
 
 ##########################
-# Misc Utils
+# 杂项辅助函数
 ##########################
 
 def get_today_str() -> str:
-    """Get current date formatted for display in prompts and outputs.
+    """获取用于提示词和输出展示的当前日期字符串。
     
-    Returns:
-        Human-readable date string in format like 'Mon Jan 15, 2024'
+    返回:
+        形如 “Mon Jan 15, 2024” 的可读日期字符串
     """
     now = datetime.now()
     return f"{now:%a} {now:%b} {now.day}, {now:%Y}"
 
 def get_config_value(value):
-    """Extract value from configuration, handling enums and None values."""
+    """从配置值中提取实际值，并兼容枚举和 None。"""
     if value is None:
         return None
     if isinstance(value, str):
@@ -890,7 +890,7 @@ def get_config_value(value):
         return value.value
 
 def get_api_key_for_model(model_name: str, config: RunnableConfig):
-    """Get API key for a specific model from environment or config."""
+    """从环境变量或配置中获取指定模型的 API Key。"""
     should_get_from_config = os.getenv("GET_API_KEYS_FROM_CONFIG", "false")
     model_name = model_name.lower()
     if should_get_from_config.lower() == "true":
@@ -914,7 +914,7 @@ def get_api_key_for_model(model_name: str, config: RunnableConfig):
         return None
 
 def get_tavily_api_key(config: RunnableConfig):
-    """Get Tavily API key from environment or config."""
+    """从环境变量或配置中获取 Tavily API Key。"""
     should_get_from_config = os.getenv("GET_API_KEYS_FROM_CONFIG", "false")
     if should_get_from_config.lower() == "true":
         api_keys = config.get("configurable", {}).get("apiKeys", {})
