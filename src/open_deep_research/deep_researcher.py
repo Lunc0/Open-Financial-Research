@@ -30,7 +30,9 @@ from open_deep_research.prompts import (
     research_system_prompt,
     transform_messages_into_research_topic_prompt,
 )
+from open_deep_research.runtime_guidance import build_runtime_guidance_item
 from open_deep_research.state import (
+    ACTIVE_RESEARCH_PLAN_STATUSES,
     AgentInputState,
     AgentState,
     ClarifyWithUser,
@@ -40,8 +42,12 @@ from open_deep_research.state import (
     ResearcherState,
     ResearchQuestion,
     SupervisorState,
-    normalize_user_guidance_item,
+    UpdateResearchPlan,
+    apply_research_plan_changes,
+    apply_research_plan_changes_with_metadata,
+    normalize_research_plan_items,
     normalize_user_guidance_items,
+    research_plan_change_to_dict,
 )
 from open_deep_research.utils import (
     anthropic_websearch_called,
@@ -60,6 +66,72 @@ from open_deep_research.utils import (
 configurable_model = init_chat_model(
     configurable_fields=("model", "max_tokens", "api_key"),
 )
+MAX_PENDING_GUIDANCE_COMPLETION_ATTEMPTS = 1
+
+
+def message_content_to_text(content) -> str:
+    """把 LangGraph Studio 聊天消息内容转换为纯文本。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict):
+                text = part.get("text") or part.get("content")
+                if text:
+                    parts.append(str(text))
+            elif part:
+                parts.append(str(part))
+        return "\n".join(parts)
+    return str(content or "")
+
+
+def get_user_message_identity(message, index: int) -> str:
+    """为用户消息生成稳定标识，优先使用 LangChain 消息 ID。"""
+    message_id = getattr(message, "id", None)
+    if message_id:
+        return str(message_id)
+    return f"message_index_{index}"
+
+
+def get_current_user_message_ids(state: dict) -> list[str]:
+    """读取当前 messages 中所有用户消息的稳定标识。"""
+    return [
+        get_user_message_identity(message, index)
+        for index, message in enumerate(state.get("messages", []))
+        if isinstance(message, HumanMessage)
+    ]
+
+
+def collect_unhandled_chat_guidance(state: dict) -> tuple[list[dict], list[str]]:
+    """把已有研究线程里的新聊天消息收集为待处理用户引导。"""
+    if not state.get("research_brief"):
+        return [], []
+
+    handled_message_ids = set(state.get("handled_user_message_ids", []))
+    guidance_items = []
+    handled_ids = []
+    for index, message in enumerate(state.get("messages", [])):
+        if not isinstance(message, HumanMessage):
+            continue
+        message_id = get_user_message_identity(message, index)
+        if message_id in handled_message_ids:
+            continue
+        content = message_content_to_text(message.content).strip()
+        if not content:
+            handled_ids.append(message_id)
+            continue
+        guidance_items.append(
+            build_runtime_guidance_item(
+                content,
+                guidance_id=f"guidance_from_{message_id}",
+                source="studio_chat",
+                priority=10,
+                applies_to="supervisor",
+            )
+        )
+        handled_ids.append(message_id)
+    return guidance_items, handled_ids
 
 
 def get_user_guidance_context(state: dict, config: RunnableConfig) -> str:
@@ -72,22 +144,7 @@ def get_user_guidance_context(state: dict, config: RunnableConfig) -> str:
 
 def get_user_guidance_items(state: dict, config: RunnableConfig) -> list[dict]:
     """从状态和配置中读取结构化用户引导列表。"""
-    configurable = Configuration.from_runnable_config(config)
     guidance_items = normalize_user_guidance_items(state.get("user_guidance", []))
-    if configurable.runtime_user_guidance:
-        existing_contents = {item["content"] for item in guidance_items}
-        if configurable.runtime_user_guidance not in existing_contents:
-            guidance_items.append(
-                normalize_user_guidance_item(
-                    {
-                        "content": configurable.runtime_user_guidance,
-                        "source": "config",
-                        "priority": 5,
-                        "applies_to": None,
-                        "status": "pending",
-                    }
-                )
-            )
     return sorted(guidance_items, key=lambda item: item["priority"], reverse=True)
 
 
@@ -100,7 +157,61 @@ def format_user_guidance_item(item: dict) -> str:
         f"{item.get('content', '')}"
     )
 
-async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Command[Literal["write_research_brief", "__end__"]]:
+
+def get_research_plan_items(state: dict) -> list[dict]:
+    """从状态中读取结构化研究计划列表。"""
+    return normalize_research_plan_items(state.get("research_plan", []))
+
+
+def get_research_plan_context(state: dict) -> str:
+    """把当前研究计划格式化为适合 supervisor 阅读的文本。"""
+    plan_items = get_research_plan_items(state)
+    if not plan_items:
+        return "当前还没有结构化研究计划。"
+    return "\n".join(
+        (
+            f"- [{item['status']}; priority={item['priority']}; id={item['id']}] "
+            f"{item['title']}: {item['description']}"
+        )
+        for item in plan_items
+    )
+
+
+def find_research_plan_item_by_id(state: dict, plan_item_id: str | None) -> dict | None:
+    """按计划项 ID 查找研究计划项，不再按研究主题自动匹配。"""
+    if not plan_item_id:
+        return None
+    for item in get_research_plan_items(state):
+        if item["id"] == plan_item_id:
+            return item
+    return None
+
+
+def get_pending_guidance_items(state: dict, config: RunnableConfig) -> list[dict]:
+    """读取尚未被计划层处理的用户引导。"""
+    return [
+        item for item in get_user_guidance_items(state, config)
+        if item.get("status") == "pending"
+    ]
+
+
+def validate_conduct_research_plan_item(state: dict, tool_call: dict) -> tuple[dict | None, str | None]:
+    """校验 ConductResearch 是否引用了可执行的 active 计划项。"""
+    args = tool_call.get("args", {})
+    plan_item_id = args.get("plan_item_id")
+    if not plan_item_id:
+        return None, "missing_plan_item_id"
+
+    plan_item = find_research_plan_item_by_id(state, plan_item_id)
+    if not plan_item:
+        return None, "invalid_plan_item_id"
+
+    if plan_item["status"] not in ACTIVE_RESEARCH_PLAN_STATUSES:
+        return plan_item, "inactive_plan_item"
+
+    return plan_item, None
+
+async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Command[Literal["write_research_brief", "research_supervisor", "__end__"]]:
     """分析用户消息，并在研究范围不清晰时提出澄清问题。
     
     该函数用于判断在进入研究流程前是否需要向用户澄清需求。
@@ -113,7 +224,44 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
     返回:
         Command：要么以澄清问题结束，要么进入研究简报阶段
     """
-    # 第 1 步：检查配置中是否启用澄清
+    # 第 1 步：已有研究简报时，Studio Chat 的新用户消息视为运行时引导
+    guidance_items, handled_message_ids = collect_unhandled_chat_guidance(state)
+    if guidance_items or handled_message_ids:
+        return Command(
+            goto="research_supervisor",
+            update={
+                "user_guidance": {
+                    "type": "append",
+                    "value": guidance_items,
+                },
+                "handled_user_message_ids": {
+                    "type": "append",
+                    "value": handled_message_ids,
+                },
+                "trace_events": build_trace_event(
+                    config,
+                    node="clarify_with_user",
+                    event_type="guidance_received",
+                    summary="Converted new Studio chat messages into runtime guidance.",
+                    details={
+                        "guidance_ids": [item["id"] for item in guidance_items],
+                        "message_ids": handled_message_ids,
+                        "content_lengths": {
+                            item["id"]: len(item["content"]) for item in guidance_items
+                        },
+                    },
+                ),
+                "node_status": build_node_status(
+                    config,
+                    node="clarify_with_user",
+                    status="completed",
+                    summary="Studio chat input was routed as runtime guidance.",
+                    details={"guidance_count": len(guidance_items)},
+                ),
+            },
+        )
+
+    # 第 2 步：检查配置中是否启用澄清
     configurable = Configuration.from_runnable_config(config)
     if not configurable.allow_clarification:
         # 跳过澄清步骤，直接进入研究
@@ -135,7 +283,7 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
             },
         )
     
-    # 第 2 步：准备结构化澄清分析所需模型
+    # 第 3 步：准备结构化澄清分析所需模型
     messages = state["messages"]
     model_config = {
         "model": configurable.research_model,
@@ -152,14 +300,14 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
         .with_config(model_config)
     )
     
-    # 第 3 步：分析是否需要澄清
+    # 第 4 步：分析是否需要澄清
     prompt_content = clarify_with_user_instructions.format(
         messages=get_buffer_string(messages), 
         date=get_today_str()
     )
     response = await clarification_model.ainvoke([HumanMessage(content=prompt_content)]) # 把刚才拼好的整段提示词包装成一条“人类消息”
     
-    # 第 4 步：根据澄清分析结果路由
+    # 第 5 步：根据澄清分析结果路由
     if response.need_clarification:
         # 返回澄清问题并结束当前轮次
         return Command(
@@ -248,27 +396,14 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
         max_concurrent_research_units=configurable.max_concurrent_research_units,
         max_researcher_iterations=configurable.max_researcher_iterations
     )
-    runtime_guidance = (
-        normalize_user_guidance_items(
-            [
-                {
-                    "content": configurable.runtime_user_guidance,
-                    "source": "config",
-                    "priority": 5,
-                    "applies_to": None,
-                    "status": "pending",
-                }
-            ]
-        )
-        if configurable.runtime_user_guidance
-        else []
-    )
-    
     return Command(
         goto="research_supervisor", 
         update={
             "research_brief": response.research_brief,
-            "user_guidance": {"type": "override", "value": runtime_guidance},
+            "handled_user_message_ids": {
+                "type": "append",
+                "value": get_current_user_message_ids(state),
+            },
             "trace_events": build_trace_event(
                 config,
                 node="write_research_brief",
@@ -320,8 +455,8 @@ async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[
         "tags": ["langsmith:nostream"]
     }
     
-    # 可用工具：研究任务分派、完成信号、策略思考
-    lead_researcher_tools = [ConductResearch, ResearchComplete, think_tool]
+    # 可用工具：显式计划更新、研究任务分派、完成信号、策略思考
+    lead_researcher_tools = [UpdateResearchPlan, ConductResearch, ResearchComplete, think_tool]
     
     # 为模型配置工具、重试逻辑与模型参数
     research_model = (
@@ -334,11 +469,15 @@ async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[
     # 第 2 步：基于当前上下文生成监督者回复
     supervisor_messages = state.get("supervisor_messages", [])
     guidance_context = get_user_guidance_context(state, config)
+    research_plan_context = get_research_plan_context(state)
     runtime_context = HumanMessage(
         content=(
             "运行时用户引导如下。若这些引导与原研究简报存在冲突，优先按最新用户引导调整后续研究；"
-            "若引导只是补充范围，则把它纳入下一轮研究计划。\n"
-            f"{guidance_context}"
+            "若存在 pending 引导，必须先通过 UpdateResearchPlan 把它映射为计划变更。\n"
+            f"{guidance_context}\n\n"
+            "当前结构化研究计划如下。没有 pending/running 计划项时，必须先调用 UpdateResearchPlan；"
+            "ConductResearch 必须带上 pending/running 计划项的 plan_item_id，不能直接按研究主题启动。\n"
+            f"{research_plan_context}"
         )
     )
     response = await research_model.ainvoke(supervisor_messages + [runtime_context])
@@ -352,6 +491,7 @@ async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[
             "iteration": state.get("research_iterations", 0) + 1,
             "tool_calls": [tool_call["name"] for tool_call in response.tool_calls],
             "user_guidance": guidance_context,
+            "research_plan": research_plan_context,
         },
     )
     if guidance_items:
@@ -359,7 +499,7 @@ async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[
             build_trace_event(
                 config,
                 node="research_supervisor",
-                event_type="guidance_applied",
+                event_type="guidance_pending",
                 summary="Supervisor read runtime user guidance for this planning step.",
                 details={
                     "guidance_ids": [item["id"] for item in guidance_items],
@@ -415,27 +555,114 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
         tool_call["name"] == "ResearchComplete" 
         for tool_call in most_recent_message.tool_calls
     )
+    pending_guidance_items = get_pending_guidance_items(state, config)
+    terminal_reason = (
+        "max_iterations"
+        if exceeded_allowed_iterations
+        else "no_tool_calls"
+        if no_tool_calls
+        else "research_complete"
+    )
     
     # 若满足任一终止条件则退出
     if exceeded_allowed_iterations or no_tool_calls or research_complete_tool_call:
+        if pending_guidance_items:
+            pending_guidance_ids = [item["id"] for item in pending_guidance_items]
+            completion_attempts = state.get("pending_guidance_completion_attempts", 0)
+            if completion_attempts < MAX_PENDING_GUIDANCE_COMPLETION_ATTEMPTS:
+                feedback_content = (
+                    "当前仍有 pending 用户引导未映射到 research_plan。"
+                    "请先调用 UpdateResearchPlan，把这些 guidance 转换为计划变更；"
+                    "在处理完成前不要调用 ResearchComplete 或直接结束。"
+                    f" pending_guidance_ids={pending_guidance_ids}"
+                )
+                feedback_messages = []
+                research_complete_calls = [
+                    tool_call for tool_call in most_recent_message.tool_calls
+                    if tool_call["name"] == "ResearchComplete"
+                ]
+                if research_complete_calls:
+                    feedback_messages = [
+                        ToolMessage(
+                            content=feedback_content,
+                            name="ResearchComplete",
+                            tool_call_id=tool_call["id"],
+                        )
+                        for tool_call in research_complete_calls
+                    ]
+                else:
+                    feedback_messages = [HumanMessage(content=feedback_content)]
+                return Command(
+                    goto="supervisor",
+                    update={
+                        "supervisor_messages": feedback_messages,
+                        "pending_guidance_completion_attempts": completion_attempts + 1,
+                        "trace_events": build_trace_event(
+                            config,
+                            node="supervisor_tools",
+                            event_type="guidance_pending_before_completion",
+                            summary="Blocked supervisor completion because pending guidance must be planned first.",
+                            details={
+                                "pending_guidance_ids": pending_guidance_ids,
+                                "reason": terminal_reason,
+                                "attempt": completion_attempts + 1,
+                            },
+                        ),
+                        "node_status": build_node_status(
+                            config,
+                            node="research_supervisor",
+                            status="running",
+                            summary="Pending guidance must be mapped to the research plan before completion.",
+                            details={"pending_guidance_ids": pending_guidance_ids},
+                        ),
+                    },
+                )
+
+            return Command(
+                goto=END,
+                update={
+                    "notes": get_notes_from_tool_calls(supervisor_messages),
+                    "research_brief": state.get("research_brief", ""),
+                    "user_guidance": {
+                        "type": "mark_status",
+                        "ids": pending_guidance_ids,
+                        "status": "error",
+                    },
+                    "pending_guidance_completion_attempts": 0,
+                    "trace_events": build_trace_event(
+                        config,
+                        node="supervisor_tools",
+                        event_type="guidance_application_failed",
+                        summary="Marked pending guidance as error after supervisor failed to plan it.",
+                        details={
+                            "pending_guidance_ids": pending_guidance_ids,
+                            "reason": terminal_reason,
+                            "attempts": completion_attempts,
+                        },
+                    ),
+                    "node_status": build_node_status(
+                        config,
+                        node="research_supervisor",
+                        status="completed",
+                        summary="Research delegation completed after unresolved guidance fallback.",
+                        details={"pending_guidance_ids": pending_guidance_ids},
+                    ),
+                },
+            )
+
         return Command(
             goto=END,
             update={
                 "notes": get_notes_from_tool_calls(supervisor_messages),
                 "research_brief": state.get("research_brief", ""),
+                "pending_guidance_completion_attempts": 0,
                 "trace_events": build_trace_event(
                     config,
                     node="supervisor_tools",
                     event_type="completed",
                     summary="Supervisor research phase completed.",
                     details={
-                        "reason": (
-                            "max_iterations"
-                            if exceeded_allowed_iterations
-                            else "no_tool_calls"
-                            if no_tool_calls
-                            else "research_complete"
-                        ),
+                        "reason": terminal_reason,
                         "iterations": research_iterations,
                     },
                 ),
@@ -489,6 +716,55 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
             name="think_tool",
             tool_call_id=tool_call["id"]
         ))
+
+    # 先处理显式计划工具，保证后续 ConductResearch 只能引用已存在计划项
+    update_research_plan_calls = [
+        tool_call for tool_call in most_recent_message.tool_calls
+        if tool_call["name"] == "UpdateResearchPlan"
+    ]
+
+    current_research_plan = get_research_plan_items(state)
+    applied_guidance_ids = []
+    for tool_call in update_research_plan_calls:
+        raw_changes = tool_call.get("args", {}).get("changes", [])
+        plan_changes = [research_plan_change_to_dict(change) for change in raw_changes]
+        current_research_plan, change_guidance_ids = apply_research_plan_changes_with_metadata(
+            current_research_plan,
+            plan_changes,
+        )
+        applied_guidance_ids.extend(change_guidance_ids)
+        all_tool_messages.append(ToolMessage(
+            content=(
+                "Research plan updated. Active plan items are now visible in state.research_plan. "
+                "Use ConductResearch with a pending or running plan_item_id to start work."
+            ),
+            name="UpdateResearchPlan",
+            tool_call_id=tool_call["id"],
+        ))
+        update_payload["trace_events"].extend(build_trace_event(
+            config,
+            node="supervisor_tools",
+            event_type="plan_updated",
+            summary="Supervisor explicitly updated the research plan.",
+            details={
+                "rationale": tool_call.get("args", {}).get("rationale", ""),
+                "changes": plan_changes,
+                "research_plan": current_research_plan,
+            },
+        ))
+
+    if update_research_plan_calls:
+        update_payload["research_plan"] = {
+            "type": "override",
+            "value": current_research_plan,
+        }
+    if applied_guidance_ids:
+        update_payload["user_guidance"] = {
+            "type": "mark_status",
+            "ids": list(dict.fromkeys(applied_guidance_ids)),
+            "status": "applied",
+        }
+        update_payload["pending_guidance_completion_attempts"] = 0
     
     # 处理 ConductResearch 调用（研究任务分派）
     conduct_research_calls = [
@@ -497,90 +773,177 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
     ]
     
     if conduct_research_calls:
-        try:
-            # 限制并发研究单元数量，避免资源耗尽
-            allowed_conduct_research_calls = conduct_research_calls[:configurable.max_concurrent_research_units]
-            overflow_conduct_research_calls = conduct_research_calls[configurable.max_concurrent_research_units:]
-            
-            # 并行执行研究任务
-            research_tasks = [
-                researcher_subgraph.ainvoke({
-                    "researcher_messages": [
-                        HumanMessage(content=tool_call["args"]["research_topic"])
-                    ],
-                    "research_topic": tool_call["args"]["research_topic"],
-                    "user_guidance": state.get("user_guidance", []),
-                }, config) 
-                for tool_call in allowed_conduct_research_calls
-            ]
-            
-            tool_results = await asyncio.gather(*research_tasks)
-            
-            # 用研究结果构造工具消息
-            for observation, tool_call in zip(tool_results, allowed_conduct_research_calls):
+        plan_state_for_validation = {
+            **state,
+            "research_plan": update_payload.get("research_plan", {}).get(
+                "value",
+                state.get("research_plan", []),
+            ),
+        }
+        executable_research_calls = []
+        plan_status_updates = []
+
+        for tool_call in conduct_research_calls:
+            plan_item, validation_error = validate_conduct_research_plan_item(
+                plan_state_for_validation,
+                tool_call,
+            )
+            if validation_error:
+                if validation_error == "missing_plan_item_id":
+                    content = (
+                        "Invalid ConductResearch call: plan_item_id is required. "
+                        "Call UpdateResearchPlan first, then reference a pending or running plan item."
+                    )
+                elif validation_error == "invalid_plan_item_id":
+                    content = (
+                        "Invalid ConductResearch call: plan_item_id does not exist in state.research_plan. "
+                        "Use UpdateResearchPlan to create or reference a valid plan item first."
+                    )
+                else:
+                    content = (
+                        "Skipped this research task because its plan item is "
+                        f"{plan_item['status']}: {plan_item['title']}"
+                    )
                 all_tool_messages.append(ToolMessage(
-                    content=observation.get("compressed_research", "Error synthesizing research report: Maximum retries exceeded"),
-                    name=tool_call["name"],
-                    tool_call_id=tool_call["id"]
+                    content=content,
+                    name="ConductResearch",
+                    tool_call_id=tool_call["id"],
                 ))
-                update_payload["trace_events"].extend(observation.get("trace_events", []))
-                update_payload["node_status"] = {
-                    **update_payload.get("node_status", {}),
-                    **observation.get("node_status", {}),
-                }
                 update_payload["trace_events"].extend(build_trace_event(
                     config,
                     node="supervisor_tools",
-                    event_type="research_task_completed",
-                    summary="A delegated research task completed.",
+                    event_type="research_task_skipped",
+                    summary="Skipped a delegated research task because its plan item is not executable.",
                     details={
-                        "research_topic": tool_call["args"]["research_topic"],
-                        "compressed_length": len(observation.get("compressed_research", "")),
+                        "reason": validation_error,
+                        "plan_item_id": tool_call.get("args", {}).get("plan_item_id"),
+                        "plan_item_status": plan_item.get("status") if plan_item else None,
+                        "research_topic": tool_call.get("args", {}).get("research_topic", ""),
                     },
                 ))
-            
-            # 对超出并发限制的研究调用返回错误消息
-            for overflow_call in overflow_conduct_research_calls:
+                continue
+            executable_research_calls.append(tool_call)
+
+        allowed_conduct_research_calls = executable_research_calls[:configurable.max_concurrent_research_units]
+        overflow_conduct_research_calls = executable_research_calls[configurable.max_concurrent_research_units:]
+
+        for tool_call in overflow_conduct_research_calls:
+            all_tool_messages.append(ToolMessage(
+                content=f"Error: Did not run this research as you have already exceeded the maximum number of concurrent research units. Please try again with {configurable.max_concurrent_research_units} or fewer research units.",
+                name="ConductResearch",
+                tool_call_id=tool_call["id"],
+            ))
+            update_payload["trace_events"].extend(build_trace_event(
+                config,
+                node="supervisor_tools",
+                event_type="research_task_skipped",
+                summary="Skipped a delegated research task because of the concurrency limit.",
+                details={
+                    "reason": "concurrency_limit",
+                    "plan_item_id": tool_call["args"]["plan_item_id"],
+                    "research_topic": tool_call["args"]["research_topic"],
+                },
+            ))
+
+        for tool_call in allowed_conduct_research_calls:
+            plan_status_updates.append({
+                "operation": "update_status",
+                "plan_item_id": tool_call["args"]["plan_item_id"],
+                "status": "running",
+            })
+
+        if plan_status_updates:
+            next_plan = apply_research_plan_changes(
+                update_payload.get("research_plan", {}).get("value", state.get("research_plan", [])),
+                plan_status_updates,
+            )
+            update_payload["research_plan"] = {
+                "type": "override",
+                "value": next_plan,
+            }
+
+        research_tasks = [
+            researcher_subgraph.ainvoke({
+                "researcher_messages": [
+                    HumanMessage(content=tool_call["args"]["research_topic"])
+                ],
+                "research_topic": tool_call["args"]["research_topic"],
+                "plan_item_id": tool_call["args"]["plan_item_id"],
+                "user_guidance": state.get("user_guidance", []),
+            }, config)
+            for tool_call in allowed_conduct_research_calls
+        ]
+
+        tool_results = await asyncio.gather(*research_tasks, return_exceptions=True)
+        raw_notes = []
+        completion_status_updates = []
+
+        for observation, tool_call in zip(tool_results, allowed_conduct_research_calls):
+            plan_item_id = tool_call["args"]["plan_item_id"]
+            if isinstance(observation, Exception):
                 all_tool_messages.append(ToolMessage(
-                    content=f"Error: Did not run this research as you have already exceeded the maximum number of concurrent research units. Please try again with {configurable.max_concurrent_research_units} or fewer research units.",
-                    name="ConductResearch",
-                    tool_call_id=overflow_call["id"]
+                    content=f"Error running research task for plan_item_id={plan_item_id}: {observation}",
+                    name=tool_call["name"],
+                    tool_call_id=tool_call["id"],
                 ))
-            
-            # 聚合所有研究结果中的原始笔记
-            raw_notes_concat = "\n".join([
-                "\n".join(observation.get("raw_notes", [])) 
-                for observation in tool_results
-            ])
-            
-            if raw_notes_concat:
-                update_payload["raw_notes"] = [raw_notes_concat]
-                
-        except Exception as e: # 出现任何错误，都会直接结束supervisor阶段，并返回当前已获取的笔记与研究简报。这是为了保证在工具调用过程中出现问题时，智能体能够优雅地降级并提供部分结果，而不是完全失败。
-            # 处理研究执行错误
-            if is_token_limit_exceeded(e, configurable.research_model) or True:
-                # 令牌上限或其他错误：结束研究阶段
-                return Command(
-                    goto=END,
-                    update={
-                        "notes": get_notes_from_tool_calls(supervisor_messages),
-                        "research_brief": state.get("research_brief", ""),
-                        "trace_events": build_trace_event(
-                            config,
-                            node="supervisor_tools",
-                            event_type="error",
-                            summary="Research task execution failed; returning partial findings.",
-                            details={"error": str(e)},
-                        ),
-                        "node_status": build_node_status(
-                            config,
-                            node="research_supervisor",
-                            status="error",
-                            summary="Research delegation failed; partial findings returned.",
-                            details={"error": str(e)},
-                        ),
-                    }
-                )
+                completion_status_updates.append({
+                    "operation": "update_status",
+                    "plan_item_id": plan_item_id,
+                    "status": "error",
+                })
+                update_payload["trace_events"].extend(build_trace_event(
+                    config,
+                    node="supervisor_tools",
+                    event_type="research_task_failed",
+                    summary="A delegated research task failed.",
+                    details={
+                        "plan_item_id": plan_item_id,
+                        "research_topic": tool_call["args"]["research_topic"],
+                        "error": str(observation),
+                    },
+                ))
+                continue
+
+            all_tool_messages.append(ToolMessage(
+                content=observation.get("compressed_research", "Error synthesizing research report: Maximum retries exceeded"),
+                name=tool_call["name"],
+                tool_call_id=tool_call["id"],
+            ))
+            update_payload["trace_events"].extend(observation.get("trace_events", []))
+            update_payload["node_status"] = {
+                **update_payload.get("node_status", {}),
+                **observation.get("node_status", {}),
+            }
+            raw_notes.extend(observation.get("raw_notes", []))
+            completion_status_updates.append({
+                "operation": "update_status",
+                "plan_item_id": plan_item_id,
+                "status": "completed",
+            })
+            update_payload["trace_events"].extend(build_trace_event(
+                config,
+                node="supervisor_tools",
+                event_type="research_task_completed",
+                summary="A delegated research task completed.",
+                details={
+                    "plan_item_id": plan_item_id,
+                    "research_topic": tool_call["args"]["research_topic"],
+                    "compressed_length": len(observation.get("compressed_research", "")),
+                },
+            ))
+
+        if raw_notes:
+            update_payload["raw_notes"] = ["\n".join(raw_notes)]
+
+        if completion_status_updates:
+            next_plan = apply_research_plan_changes(
+                update_payload.get("research_plan", {}).get("value", state.get("research_plan", [])),
+                completion_status_updates,
+            )
+            update_payload["research_plan"] = {
+                "type": "override",
+                "value": next_plan,
+            }
     
     # 第 3 步：返回包含全部工具结果的命令
     update_payload["supervisor_messages"] = all_tool_messages
@@ -669,6 +1032,7 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
                 summary="Researcher planned or requested tools for a subtask.",
                 details={
                     "research_topic": state.get("research_topic", ""),
+                    "plan_item_id": state.get("plan_item_id"),
                     "iteration": state.get("tool_call_iterations", 0) + 1,
                     "tool_calls": [tool_call["name"] for tool_call in response.tool_calls],
                 },
@@ -680,6 +1044,7 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
                 summary="Researcher is collecting evidence.",
                 details={
                     "research_topic": state.get("research_topic", ""),
+                    "plan_item_id": state.get("plan_item_id"),
                     "iteration": state.get("tool_call_iterations", 0) + 1,
                 },
             ),
@@ -958,6 +1323,7 @@ researcher_builder.add_edge("compress_research", END)      # 压缩后退出节�
 
 # 编译研究员子图，供监督者并行调用
 researcher_subgraph = researcher_builder.compile()
+
 
 async def final_report_generation(state: AgentState, config: RunnableConfig):
     """生成最终综合研究报告，并包含令牌上限重试机制。

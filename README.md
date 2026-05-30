@@ -85,7 +85,9 @@ See the fields in the [configuration.py](https://github.com/langchain-ai/open_de
 This fork adds three workflow controls for finance-oriented research and more transparent runs:
 
 - `research_profile`: choose `general` or `finance`. The finance profile biases planning, source selection, evidence handling, and report writing toward primary financial sources, explicit metric/date/currency definitions, risk scenarios, assumptions, and auditability.
-- `runtime_user_guidance`: optional guidance that can be injected while research is running. LangGraph clients can also update `state.user_guidance` on a checkpoint to add or modify research direction before the next supervisor or researcher step.
+- `state.user_guidance`: runtime guidance injected through graph state or checkpoint updates. Clients can append structured guidance while research is running to add or modify research direction before the next supervisor or researcher step.
+- `append_runtime_guidance`: service-layer helper for chat backends. When a user sends a message while a research thread is active, call this helper with the graph, thread config, and message content to append pending guidance into `state.user_guidance`.
+- LangGraph Studio Chat: after a research thread already has a `research_brief`, new user messages in the same thread are converted into pending `state.user_guidance` and routed back to the supervisor instead of rewriting the original brief.
 - `enable_traceability`: when enabled, the graph emits `trace_events` and `node_status` in state. UIs can stream or inspect these fields to show what each node is doing, which tools were called, which subtopics were delegated, and why a phase stopped.
 
 ### 📊 Evaluation

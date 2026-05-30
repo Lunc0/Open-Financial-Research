@@ -25,6 +25,8 @@ def test_lead_researcher_prompt_contains_domain_profile_placeholder():
         max_concurrent_research_units=2,
     )
     assert "使用金融研究标准。" in rendered
+    assert "UpdateResearchPlan" in rendered
+    assert "plan_item_id" in rendered
 
 
 def test_research_system_prompt_contains_profile_and_guidance_placeholders():

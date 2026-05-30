@@ -104,16 +104,6 @@ class Configuration(BaseModel):
             }
         },
     )
-    runtime_user_guidance: Optional[str] = Field(
-        default=None,
-        optional=True,
-        metadata={
-            "x_oap_ui_config": {
-                "type": "textarea",
-                "description": "Optional guidance injected while research is running. Clients can also update state.user_guidance directly.",
-            }
-        },
-    )
     # Research Configuration
     search_api: SearchAPI = Field(
         default=SearchAPI.TAVILY,
