@@ -1,7 +1,7 @@
 """Deep Research 智能体的图状态定义与数据结构。"""
 
 import operator
-from typing import Annotated, Optional
+from typing import Annotated, Any, Optional
 
 from langchain_core.messages import MessageLikeRepresentation
 from langgraph.graph import MessagesState
@@ -58,6 +58,16 @@ def override_reducer(current_value, new_value):
         return new_value.get("value", new_value)
     else:
         return operator.add(current_value, new_value)
+
+def merge_dict_reducer(current_value, new_value):
+    """合并字典状态，并支持 override 语义。"""
+    if isinstance(new_value, dict) and new_value.get("type") == "override":
+        return new_value.get("value", {})
+    if current_value is None:
+        current_value = {}
+    if new_value is None:
+        new_value = {}
+    return {**current_value, **new_value}
     
 class AgentInputState(MessagesState):
     """输入状态，仅包含 `messages`。"""
@@ -69,6 +79,9 @@ class AgentState(MessagesState):
     research_brief: Optional[str]
     raw_notes: Annotated[list[str], override_reducer] = []
     notes: Annotated[list[str], override_reducer] = []
+    user_guidance: Annotated[list[str], override_reducer] = []
+    trace_events: Annotated[list[dict[str, Any]], operator.add] = []
+    node_status: Annotated[dict[str, Any], merge_dict_reducer] = {}
     final_report: str
 
 class SupervisorState(TypedDict):
@@ -79,6 +92,9 @@ class SupervisorState(TypedDict):
     notes: Annotated[list[str], override_reducer] = []
     research_iterations: int = 0
     raw_notes: Annotated[list[str], override_reducer] = []
+    user_guidance: Annotated[list[str], override_reducer] = []
+    trace_events: Annotated[list[dict[str, Any]], operator.add] = []
+    node_status: Annotated[dict[str, Any], merge_dict_reducer] = {}
 
 class ResearcherState(TypedDict):
     """单个研究员的状态，用于执行具体研究任务。"""
@@ -88,9 +104,14 @@ class ResearcherState(TypedDict):
     research_topic: str
     compressed_research: str
     raw_notes: Annotated[list[str], override_reducer] = []
+    user_guidance: Annotated[list[str], override_reducer] = []
+    trace_events: Annotated[list[dict[str, Any]], operator.add] = []
+    node_status: Annotated[dict[str, Any], merge_dict_reducer] = {}
 
 class ResearcherOutputState(BaseModel):
     """单个研究员子图的输出状态。"""
     
     compressed_research: str
     raw_notes: Annotated[list[str], override_reducer] = []
+    trace_events: Annotated[list[dict[str, Any]], operator.add] = []
+    node_status: Annotated[dict[str, Any], merge_dict_reducer] = {}

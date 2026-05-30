@@ -16,6 +16,12 @@ class SearchAPI(Enum):
     TAVILY = "tavily"
     NONE = "none"
 
+class ResearchProfile(Enum):
+    """Domain-specific research behavior profiles."""
+
+    GENERAL = "general"
+    FINANCE = "finance"
+
 class MCPConfig(BaseModel):
     """Configuration for Model Context Protocol (MCP) servers."""
     
@@ -73,6 +79,40 @@ class Configuration(BaseModel):
                 "description": "Maximum number of research units to run concurrently. This will allow the researcher to use multiple sub-agents to conduct research. Note: with more concurrency, you may run into rate limits."
             }
         }
+    )
+    research_profile: ResearchProfile = Field(
+        default=ResearchProfile.GENERAL,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "select",
+                "default": ResearchProfile.GENERAL.value,
+                "description": "Domain profile that changes planning, source preference, and report style.",
+                "options": [
+                    {"label": "General", "value": ResearchProfile.GENERAL.value},
+                    {"label": "Finance", "value": ResearchProfile.FINANCE.value},
+                ],
+            }
+        },
+    )
+    enable_traceability: bool = Field(
+        default=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": True,
+                "description": "Whether to record node status and trace events for progress tracking and auditability.",
+            }
+        },
+    )
+    runtime_user_guidance: Optional[str] = Field(
+        default=None,
+        optional=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "textarea",
+                "description": "Optional guidance injected while research is running. Clients can also update state.user_guidance directly.",
+            }
+        },
     )
     # Research Configuration
     search_api: SearchAPI = Field(

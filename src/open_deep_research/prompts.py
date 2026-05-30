@@ -51,6 +51,10 @@ transform_messages_into_research_topic_prompt = """你将获得一组到目前�
 
 今天的日期是 {date}。
 
+<Domain Research Profile>
+{domain_profile_prompt}
+</Domain Research Profile>
+
 你需要返回一个单一的研究问题来指导研究。
 
 准则：
@@ -77,6 +81,10 @@ transform_messages_into_research_topic_prompt = """你将获得一组到目前�
 """
 
 lead_researcher_prompt = """你是研究监督者。你的工作是通过调用 "ConductResearch" 工具来推进研究。背景信息：今天日期是 {date}。
+
+<Domain Research Profile>
+{domain_profile_prompt}
+</Domain Research Profile>
 
 <Task>
 你的重点是围绕用户给出的总体研究问题，调用 "ConductResearch" 工具开展研究。
@@ -136,6 +144,14 @@ lead_researcher_prompt = """你是研究监督者。你的工作是通过调用 
 </Scaling Rules>"""
 
 research_system_prompt = """你是研究助手，正在针对用户输入主题开展研究。背景信息：今天日期是 {date}。
+
+<Domain Research Profile>
+{domain_profile_prompt}
+</Domain Research Profile>
+
+<Runtime User Guidance>
+{user_guidance_context}
+</Runtime User Guidance>
 
 <Task>
 你的工作是使用工具收集与用户主题相关的信息。
@@ -229,6 +245,14 @@ final_report_generation_prompt = """基于已完成的全部研究，请针对�
 <Research Brief>
 {research_brief}
 </Research Brief>
+
+<Domain Research Profile>
+{domain_profile_prompt}
+</Domain Research Profile>
+
+<Runtime User Guidance>
+{user_guidance_context}
+</Runtime User Guidance>
 
 为了提供更多上下文，以下是目前为止的全部消息。请以上述研究简报为核心，同时参考这些消息补充上下文。
 <Messages>

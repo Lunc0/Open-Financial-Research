@@ -80,6 +80,14 @@ Open Deep Research supports a wide range of search tools. By default it uses the
 
 See the fields in the [configuration.py](https://github.com/langchain-ai/open_deep_research/blob/main/src/open_deep_research/configuration.py) for various other settings to customize the behavior of Open Deep Research. 
 
+#### Domain profile, runtime guidance, and traceability
+
+This fork adds three workflow controls for finance-oriented research and more transparent runs:
+
+- `research_profile`: choose `general` or `finance`. The finance profile biases planning, source selection, evidence handling, and report writing toward primary financial sources, explicit metric/date/currency definitions, risk scenarios, assumptions, and auditability.
+- `runtime_user_guidance`: optional guidance that can be injected while research is running. LangGraph clients can also update `state.user_guidance` on a checkpoint to add or modify research direction before the next supervisor or researcher step.
+- `enable_traceability`: when enabled, the graph emits `trace_events` and `node_status` in state. UIs can stream or inspect these fields to show what each node is doing, which tools were called, which subtopics were delegated, and why a phase stopped.
+
 ### 📊 Evaluation
 
 Open Deep Research is configured for evaluation with [Deep Research Bench](https://huggingface.co/spaces/Ayanami0730/DeepResearch-Leaderboard). This benchmark has 100 PhD-level research tasks (50 English, 50 Chinese), crafted by domain experts across 22 fields (e.g., Science & Tech, Business & Finance) to mirror real-world deep-research needs. It has 2 evaluation metrics, but the leaderboard is based on the RACE score. This uses LLM-as-a-judge (Gemini) to evaluate research reports against a golden set of reports compiled by experts across a set of metrics.

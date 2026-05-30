@@ -19,6 +19,8 @@ from langgraph.types import Command
 from open_deep_research.configuration import (
     Configuration,
 )
+from open_deep_research.domain_profiles import get_domain_profile_prompt
+from open_deep_research.observability import build_node_status, build_trace_event
 from open_deep_research.prompts import (
     clarify_with_user_instructions,
     compress_research_simple_human_message,
@@ -57,6 +59,17 @@ configurable_model = init_chat_model(
     configurable_fields=("model", "max_tokens", "api_key"),
 )
 
+
+def get_user_guidance_context(state: dict, config: RunnableConfig) -> str:
+    """Build latest user guidance context from state and config."""
+    configurable = Configuration.from_runnable_config(config)
+    guidance_items = list(state.get("user_guidance", []) or [])
+    if configurable.runtime_user_guidance:
+        guidance_items.append(configurable.runtime_user_guidance)
+    if not guidance_items:
+        return "当前没有运行时用户引导。"
+    return "\n".join(f"- {item}" for item in guidance_items if item)
+
 async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Command[Literal["write_research_brief", "__end__"]]:
     """分析用户消息，并在研究范围不清晰时提出澄清问题。
     
@@ -74,7 +87,23 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
     configurable = Configuration.from_runnable_config(config)
     if not configurable.allow_clarification:
         # 跳过澄清步骤，直接进入研究
-        return Command(goto="write_research_brief")
+        return Command(
+            goto="write_research_brief",
+            update={
+                "trace_events": build_trace_event(
+                    config,
+                    node="clarify_with_user",
+                    event_type="skipped",
+                    summary="Clarification disabled; proceeding to research brief.",
+                ),
+                "node_status": build_node_status(
+                    config,
+                    node="clarify_with_user",
+                    status="skipped",
+                    summary="Clarification disabled.",
+                ),
+            },
+        )
     
     # 第 2 步：准备结构化澄清分析所需模型
     messages = state["messages"]
@@ -105,13 +134,42 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
         # 返回澄清问题并结束当前轮次
         return Command(
             goto=END, 
-            update={"messages": [AIMessage(content=response.question)]}
+            update={
+                "messages": [AIMessage(content=response.question)],
+                "trace_events": build_trace_event(
+                    config,
+                    node="clarify_with_user",
+                    event_type="clarification_requested",
+                    summary="Asked the user to clarify the research scope.",
+                    details={"question": response.question},
+                ),
+                "node_status": build_node_status(
+                    config,
+                    node="clarify_with_user",
+                    status="waiting_for_user",
+                    summary="Waiting for scope clarification.",
+                ),
+            }
         )
     else:
         # 返回确认信息并继续研究流程
         return Command(
             goto="write_research_brief", 
-            update={"messages": [AIMessage(content=response.verification)]}
+            update={
+                "messages": [AIMessage(content=response.verification)],
+                "trace_events": build_trace_event(
+                    config,
+                    node="clarify_with_user",
+                    event_type="completed",
+                    summary="Research scope is clear enough to continue.",
+                ),
+                "node_status": build_node_status(
+                    config,
+                    node="clarify_with_user",
+                    status="completed",
+                    summary="Scope confirmed.",
+                ),
+            }
         )
 
 
@@ -148,21 +206,42 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
     # 第 2 步：根据用户消息生成结构化研究简报
     prompt_content = transform_messages_into_research_topic_prompt.format(
         messages=get_buffer_string(state.get("messages", [])),
-        date=get_today_str()
+        date=get_today_str(),
+        domain_profile_prompt=get_domain_profile_prompt(configurable.research_profile),
     )
     response = await research_model.ainvoke([HumanMessage(content=prompt_content)])
     
     # 第 3 步：用研究简报和指令初始化监督者
     supervisor_system_prompt = lead_researcher_prompt.format(
         date=get_today_str(),
+        domain_profile_prompt=get_domain_profile_prompt(configurable.research_profile),
         max_concurrent_research_units=configurable.max_concurrent_research_units,
         max_researcher_iterations=configurable.max_researcher_iterations
     )
+    runtime_guidance = [configurable.runtime_user_guidance] if configurable.runtime_user_guidance else []
     
     return Command(
         goto="research_supervisor", 
         update={
             "research_brief": response.research_brief,
+            "user_guidance": {"type": "override", "value": runtime_guidance},
+            "trace_events": build_trace_event(
+                config,
+                node="write_research_brief",
+                event_type="completed",
+                summary="Created research brief and initialized supervisor.",
+                details={
+                    "research_profile": configurable.research_profile.value,
+                    "research_brief_preview": response.research_brief[:500],
+                },
+            ),
+            "node_status": build_node_status(
+                config,
+                node="write_research_brief",
+                status="completed",
+                summary="Research brief created.",
+                details={"research_profile": configurable.research_profile.value},
+            ),
             "supervisor_messages": {
                 "type": "override",
                 "value": [
@@ -210,14 +289,40 @@ async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[
     
     # 第 2 步：基于当前上下文生成监督者回复
     supervisor_messages = state.get("supervisor_messages", [])
-    response = await research_model.ainvoke(supervisor_messages)
+    guidance_context = get_user_guidance_context(state, config)
+    runtime_context = HumanMessage(
+        content=(
+            "运行时用户引导如下。若这些引导与原研究简报存在冲突，优先按最新用户引导调整后续研究；"
+            "若引导只是补充范围，则把它纳入下一轮研究计划。\n"
+            f"{guidance_context}"
+        )
+    )
+    response = await research_model.ainvoke(supervisor_messages + [runtime_context])
     
     # 第 3 步：更新状态并进入工具执行阶段
     return Command(
         goto="supervisor_tools",
         update={
             "supervisor_messages": [response],
-            "research_iterations": state.get("research_iterations", 0) + 1
+            "research_iterations": state.get("research_iterations", 0) + 1,
+            "trace_events": build_trace_event(
+                config,
+                node="research_supervisor",
+                event_type="iteration",
+                summary="Supervisor planned the next research step.",
+                details={
+                    "iteration": state.get("research_iterations", 0) + 1,
+                    "tool_calls": [tool_call["name"] for tool_call in response.tool_calls],
+                    "user_guidance": guidance_context,
+                },
+            ),
+            "node_status": build_node_status(
+                config,
+                node="research_supervisor",
+                status="running",
+                summary="Supervisor is planning and delegating research.",
+                details={"iteration": state.get("research_iterations", 0) + 1},
+            ),
         }
     )
 
@@ -256,13 +361,59 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
             goto=END,
             update={
                 "notes": get_notes_from_tool_calls(supervisor_messages),
-                "research_brief": state.get("research_brief", "")
+                "research_brief": state.get("research_brief", ""),
+                "trace_events": build_trace_event(
+                    config,
+                    node="supervisor_tools",
+                    event_type="completed",
+                    summary="Supervisor research phase completed.",
+                    details={
+                        "reason": (
+                            "max_iterations"
+                            if exceeded_allowed_iterations
+                            else "no_tool_calls"
+                            if no_tool_calls
+                            else "research_complete"
+                        ),
+                        "iterations": research_iterations,
+                    },
+                ),
+                "node_status": build_node_status(
+                    config,
+                    node="research_supervisor",
+                    status="completed",
+                    summary="Research delegation completed.",
+                    details={"iterations": research_iterations},
+                ),
             }
         )
     
     # 第 2 步：统一处理全部工具调用（含 think_tool 与 ConductResearch）
     all_tool_messages = []
-    update_payload = {"supervisor_messages": []}
+    update_payload = {
+        "supervisor_messages": [],
+        "trace_events": build_trace_event(
+            config,
+            node="supervisor_tools",
+            event_type="tool_calls_received",
+            summary="Supervisor tool calls are being processed.",
+            details={
+                "tool_calls": [
+                    {
+                        "name": tool_call["name"],
+                        "args": tool_call.get("args", {}),
+                    }
+                    for tool_call in most_recent_message.tool_calls
+                ]
+            },
+        ),
+        "node_status": build_node_status(
+            config,
+            node="supervisor_tools",
+            status="running",
+            summary="Processing supervisor tool calls.",
+        ),
+    }
     
     # 处理 think_tool 调用（策略反思）
     think_tool_calls = [
@@ -296,7 +447,8 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
                     "researcher_messages": [
                         HumanMessage(content=tool_call["args"]["research_topic"])
                     ],
-                    "research_topic": tool_call["args"]["research_topic"]
+                    "research_topic": tool_call["args"]["research_topic"],
+                    "user_guidance": state.get("user_guidance", []),
                 }, config) 
                 for tool_call in allowed_conduct_research_calls
             ]
@@ -309,6 +461,21 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
                     content=observation.get("compressed_research", "Error synthesizing research report: Maximum retries exceeded"),
                     name=tool_call["name"],
                     tool_call_id=tool_call["id"]
+                ))
+                update_payload["trace_events"].extend(observation.get("trace_events", []))
+                update_payload["node_status"] = {
+                    **update_payload.get("node_status", {}),
+                    **observation.get("node_status", {}),
+                }
+                update_payload["trace_events"].extend(build_trace_event(
+                    config,
+                    node="supervisor_tools",
+                    event_type="research_task_completed",
+                    summary="A delegated research task completed.",
+                    details={
+                        "research_topic": tool_call["args"]["research_topic"],
+                        "compressed_length": len(observation.get("compressed_research", "")),
+                    },
                 ))
             
             # 对超出并发限制的研究调用返回错误消息
@@ -336,7 +503,21 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
                     goto=END,
                     update={
                         "notes": get_notes_from_tool_calls(supervisor_messages),
-                        "research_brief": state.get("research_brief", "")
+                        "research_brief": state.get("research_brief", ""),
+                        "trace_events": build_trace_event(
+                            config,
+                            node="supervisor_tools",
+                            event_type="error",
+                            summary="Research task execution failed; returning partial findings.",
+                            details={"error": str(e)},
+                        ),
+                        "node_status": build_node_status(
+                            config,
+                            node="research_supervisor",
+                            status="error",
+                            summary="Research delegation failed; partial findings returned.",
+                            details={"error": str(e)},
+                        ),
                     }
                 )
     
@@ -397,7 +578,9 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
     # 若存在 MCP 上下文则注入系统提示
     researcher_prompt = research_system_prompt.format(
         mcp_prompt=configurable.mcp_prompt or "", 
-        date=get_today_str()
+        date=get_today_str(),
+        domain_profile_prompt=get_domain_profile_prompt(configurable.research_profile),
+        user_guidance_context=get_user_guidance_context(state, config),
     )
     
     # 为模型配置工具、重试逻辑与参数
@@ -417,7 +600,28 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
         goto="researcher_tools",
         update={
             "researcher_messages": [response],
-            "tool_call_iterations": state.get("tool_call_iterations", 0) + 1
+            "tool_call_iterations": state.get("tool_call_iterations", 0) + 1,
+            "trace_events": build_trace_event(
+                config,
+                node="researcher",
+                event_type="iteration",
+                summary="Researcher planned or requested tools for a subtask.",
+                details={
+                    "research_topic": state.get("research_topic", ""),
+                    "iteration": state.get("tool_call_iterations", 0) + 1,
+                    "tool_calls": [tool_call["name"] for tool_call in response.tool_calls],
+                },
+            ),
+            "node_status": build_node_status(
+                config,
+                node="researcher",
+                status="running",
+                summary="Researcher is collecting evidence.",
+                details={
+                    "research_topic": state.get("research_topic", ""),
+                    "iteration": state.get("tool_call_iterations", 0) + 1,
+                },
+            ),
         }
     )
 
@@ -460,7 +664,24 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
     )
     
     if not has_tool_calls and not has_native_search:
-        return Command(goto="compress_research") # 有机会重新尝试 但是否重试取决于 supervisor 模型的判断 ； 
+        return Command(
+            goto="compress_research",
+            update={
+                "trace_events": build_trace_event(
+                    config,
+                    node="researcher_tools",
+                    event_type="no_tool_calls",
+                    summary="Researcher stopped tool use and moved to compression.",
+                    details={"research_topic": state.get("research_topic", "")},
+                ),
+                "node_status": build_node_status(
+                    config,
+                    node="researcher_tools",
+                    status="completed",
+                    summary="No further tools requested.",
+                ),
+            },
+        ) # 有机会重新尝试 但是否重试取决于 supervisor 模型的判断 ；
                                                  # 真出了“异常”，那么异常会向上抛，又因为upervisor的工具调用是放在 try except 里的，所以最终会被捕获到（or true），并优雅地结束整个研究阶段，返回当前已获取的笔记与研究简报。这种设计既保证了智能体的鲁棒性，又能在出现问题时提供部分结果，而不是完全失败。
     
     # 第 2 步：处理其他工具调用（搜索、MCP 等）
@@ -477,6 +698,23 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
         for tool_call in tool_calls
     ]
     observations = await asyncio.gather(*tool_execution_tasks) # 把这些工具任务并发跑起来
+    tool_trace_events = build_trace_event(
+        config,
+        node="researcher_tools",
+        event_type="tool_calls_executed",
+        summary="Researcher tool calls completed.",
+        details={
+            "research_topic": state.get("research_topic", ""),
+            "tool_calls": [
+                {
+                    "name": tool_call["name"],
+                    "args": tool_call.get("args", {}),
+                    "observation_length": len(str(observation)),
+                }
+                for tool_call, observation in zip(tool_calls, observations)
+            ],
+        },
+    )
     
     # 根据执行结果构造工具消息
     tool_outputs = [
@@ -499,13 +737,35 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
         # 结束研究并进入压缩阶段
         return Command(
             goto="compress_research",
-            update={"researcher_messages": tool_outputs}
+            update={
+                "researcher_messages": tool_outputs,
+                "trace_events": tool_trace_events,
+                "node_status": build_node_status(
+                    config,
+                    node="researcher_tools",
+                    status="completed",
+                    summary="Tool budget reached or research marked complete.",
+                    details={
+                        "exceeded_iterations": exceeded_iterations,
+                        "research_complete_called": research_complete_called,
+                    },
+                ),
+            }
         )
     
     # 携带工具结果继续研究循环
     return Command(
         goto="researcher",
-        update={"researcher_messages": tool_outputs}
+        update={
+            "researcher_messages": tool_outputs,
+            "trace_events": tool_trace_events,
+            "node_status": build_node_status(
+                config,
+                node="researcher_tools",
+                status="running",
+                summary="Tool observations added; researcher will continue.",
+            ),
+        }
     )
 
 async def compress_research(state: ResearcherState, config: RunnableConfig):
@@ -558,7 +818,25 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
             # 返回压缩成功结果
             return {
                 "compressed_research": str(response.content),
-                "raw_notes": [raw_notes_content]
+                "raw_notes": [raw_notes_content],
+                "trace_events": build_trace_event(
+                    config,
+                    node="compress_research",
+                    event_type="completed",
+                    summary="Compressed subtask findings.",
+                    details={
+                        "research_topic": state.get("research_topic", ""),
+                        "compressed_length": len(str(response.content)),
+                        "raw_notes_length": len(raw_notes_content),
+                    },
+                ),
+                "node_status": build_node_status(
+                    config,
+                    node="compress_research",
+                    status="completed",
+                    summary="Subtask findings compressed.",
+                    details={"research_topic": state.get("research_topic", "")},
+                ),
             }
             
         except Exception as e:
@@ -580,7 +858,24 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
     
     return {
         "compressed_research": "Error synthesizing research report: Maximum retries exceeded",
-        "raw_notes": [raw_notes_content]
+        "raw_notes": [raw_notes_content],
+        "trace_events": build_trace_event(
+            config,
+            node="compress_research",
+            event_type="error",
+            summary="Compression retries were exhausted.",
+            details={
+                "research_topic": state.get("research_topic", ""),
+                "raw_notes_length": len(raw_notes_content),
+            },
+        ),
+        "node_status": build_node_status(
+            config,
+            node="compress_research",
+            status="error",
+            summary="Could not compress subtask findings after retries.",
+            details={"research_topic": state.get("research_topic", "")},
+        ),
     }
 
 # 研究员子图构建
@@ -640,6 +935,8 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
             # 构造包含全部研究上下文的综合提示词
             final_report_prompt = final_report_generation_prompt.format(
                 research_brief=state.get("research_brief", ""),
+                domain_profile_prompt=get_domain_profile_prompt(configurable.research_profile),
+                user_guidance_context=get_user_guidance_context(state, config),
                 messages=get_buffer_string(state.get("messages", [])),
                 findings=findings,
                 date=get_today_str()
@@ -654,6 +951,23 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
             return {
                 "final_report": final_report.content, 
                 "messages": [final_report],
+                "trace_events": build_trace_event(
+                    config,
+                    node="final_report_generation",
+                    event_type="completed",
+                    summary="Final report generated.",
+                    details={
+                        "findings_length": len(findings),
+                        "report_length": len(str(final_report.content)),
+                    },
+                ),
+                "node_status": build_node_status(
+                    config,
+                    node="final_report_generation",
+                    status="completed",
+                    summary="Final report generated.",
+                    details={"report_length": len(str(final_report.content))},
+                ),
                 **cleared_state
             }
             
@@ -669,6 +983,20 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
                         return {
                             "final_report": f"Error generating final report: Token limit exceeded, however, we could not determine the model's maximum context length. Please update the model map in deep_researcher/utils.py with this information. {e}",
                             "messages": [AIMessage(content="Report generation failed due to token limits")],
+                            "trace_events": build_trace_event(
+                                config,
+                                node="final_report_generation",
+                                event_type="error",
+                                summary="Final report failed because token limit metadata is missing.",
+                                details={"error": str(e)},
+                            ),
+                            "node_status": build_node_status(
+                                config,
+                                node="final_report_generation",
+                                status="error",
+                                summary="Token limit exceeded and model limit is unknown.",
+                                details={"error": str(e)},
+                            ),
                             **cleared_state
                         }
                     # 使用 token 上限的 4 倍作为字符数近似截断阈值
@@ -685,6 +1013,20 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
                 return {
                     "final_report": f"Error generating final report: {e}",
                     "messages": [AIMessage(content="Report generation failed due to an error")],
+                    "trace_events": build_trace_event(
+                        config,
+                        node="final_report_generation",
+                        event_type="error",
+                        summary="Final report generation failed.",
+                        details={"error": str(e)},
+                    ),
+                    "node_status": build_node_status(
+                        config,
+                        node="final_report_generation",
+                        status="error",
+                        summary="Final report generation failed.",
+                        details={"error": str(e)},
+                    ),
                     **cleared_state
                 }
     
@@ -692,6 +1034,18 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
     return {
         "final_report": "Error generating final report: Maximum retries exceeded",
         "messages": [AIMessage(content="Report generation failed after maximum retries")],
+        "trace_events": build_trace_event(
+            config,
+            node="final_report_generation",
+            event_type="error",
+            summary="Final report retries were exhausted.",
+        ),
+        "node_status": build_node_status(
+            config,
+            node="final_report_generation",
+            status="error",
+            summary="Final report retries exhausted.",
+        ),
         **cleared_state
     }
 
