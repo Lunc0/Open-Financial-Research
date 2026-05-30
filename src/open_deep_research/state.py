@@ -1,7 +1,9 @@
 """Deep Research 智能体的图状态定义与数据结构。"""
 
 import operator
+from datetime import datetime, timezone
 from typing import Annotated, Any, Optional
+from uuid import uuid4
 
 from langchain_core.messages import MessageLikeRepresentation
 from langgraph.graph import MessagesState
@@ -51,6 +53,91 @@ class ResearchQuestion(BaseModel):
 ###################
 # 状态定义
 ###################
+class UserGuidanceItem(TypedDict):
+    """运行时用户引导的结构化状态对象。"""
+
+    id: str
+    content: str
+    created_at: str
+    source: str
+    priority: int
+    applies_to: Optional[str]
+    status: str
+
+
+def normalize_user_guidance_item(
+    item: str | dict[str, Any],
+    *,
+    default_source: str = "user",
+    default_status: str = "pending",
+) -> UserGuidanceItem:
+    """把旧字符串格式或字典格式统一转换为结构化用户引导。"""
+    if isinstance(item, str):
+        return {
+            "id": f"guidance_{uuid4().hex}",
+            "content": item,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "source": default_source,
+            "priority": 0,
+            "applies_to": None,
+            "status": default_status,
+        }
+
+    return {
+        "id": str(item.get("id") or f"guidance_{uuid4().hex}"),
+        "content": str(item.get("content", "")),
+        "created_at": str(item.get("created_at") or datetime.now(timezone.utc).isoformat()),
+        "source": str(item.get("source") or default_source),
+        "priority": int(item.get("priority", 0)),
+        "applies_to": item.get("applies_to"),
+        "status": str(item.get("status") or default_status),
+    }
+
+
+def normalize_user_guidance_items(
+    value: Any,
+    *,
+    default_source: str = "user",
+    default_status: str = "pending",
+) -> list[UserGuidanceItem]:
+    """把任意支持的用户引导输入格式转换为结构化列表。"""
+    if value is None:
+        return []
+
+    raw_items = value if isinstance(value, list) else [value]
+    normalized_items = []
+    for item in raw_items:
+        if not item:
+            continue
+        normalized_item = normalize_user_guidance_item(
+            item,
+            default_source=default_source,
+            default_status=default_status,
+        )
+        if normalized_item["content"]:
+            normalized_items.append(normalized_item)
+    return normalized_items
+
+
+def user_guidance_reducer(current_value, new_value):
+    """合并运行时用户引导，并支持追加、覆盖和状态标记。"""
+    current_items = normalize_user_guidance_items(current_value)
+
+    if isinstance(new_value, dict):
+        operation = new_value.get("type")
+        if operation == "override":
+            return normalize_user_guidance_items(new_value.get("value", []))
+        if operation == "append":
+            return current_items + normalize_user_guidance_items(new_value.get("value", []))
+        if operation == "mark_status":
+            target_ids = set(new_value.get("ids", []))
+            next_status = str(new_value.get("status", "applied"))
+            return [
+                {**item, "status": next_status} if item["id"] in target_ids else item
+                for item in current_items
+            ]
+
+    return current_items + normalize_user_guidance_items(new_value)
 
 def override_reducer(current_value, new_value):
     """允许在状态合并时直接覆盖字段值的 reducer 函数。"""
@@ -79,7 +166,7 @@ class AgentState(MessagesState):
     research_brief: Optional[str]
     raw_notes: Annotated[list[str], override_reducer] = []
     notes: Annotated[list[str], override_reducer] = []
-    user_guidance: Annotated[list[str], override_reducer] = []
+    user_guidance: Annotated[list[UserGuidanceItem], user_guidance_reducer] = []
     trace_events: Annotated[list[dict[str, Any]], operator.add] = []
     node_status: Annotated[dict[str, Any], merge_dict_reducer] = {}
     final_report: str
@@ -92,7 +179,7 @@ class SupervisorState(TypedDict):
     notes: Annotated[list[str], override_reducer] = []
     research_iterations: int = 0
     raw_notes: Annotated[list[str], override_reducer] = []
-    user_guidance: Annotated[list[str], override_reducer] = []
+    user_guidance: Annotated[list[UserGuidanceItem], user_guidance_reducer] = []
     trace_events: Annotated[list[dict[str, Any]], operator.add] = []
     node_status: Annotated[dict[str, Any], merge_dict_reducer] = {}
 
@@ -104,7 +191,7 @@ class ResearcherState(TypedDict):
     research_topic: str
     compressed_research: str
     raw_notes: Annotated[list[str], override_reducer] = []
-    user_guidance: Annotated[list[str], override_reducer] = []
+    user_guidance: Annotated[list[UserGuidanceItem], user_guidance_reducer] = []
     trace_events: Annotated[list[dict[str, Any]], operator.add] = []
     node_status: Annotated[dict[str, Any], merge_dict_reducer] = {}
 

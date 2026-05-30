@@ -40,6 +40,8 @@ from open_deep_research.state import (
     ResearcherState,
     ResearchQuestion,
     SupervisorState,
+    normalize_user_guidance_item,
+    normalize_user_guidance_items,
 )
 from open_deep_research.utils import (
     anthropic_websearch_called,
@@ -61,14 +63,42 @@ configurable_model = init_chat_model(
 
 
 def get_user_guidance_context(state: dict, config: RunnableConfig) -> str:
-    """Build latest user guidance context from state and config."""
-    configurable = Configuration.from_runnable_config(config)
-    guidance_items = list(state.get("user_guidance", []) or [])
-    if configurable.runtime_user_guidance:
-        guidance_items.append(configurable.runtime_user_guidance)
+    """从状态和配置中构建最新的用户引导上下文。"""
+    guidance_items = get_user_guidance_items(state, config)
     if not guidance_items:
         return "当前没有运行时用户引导。"
-    return "\n".join(f"- {item}" for item in guidance_items if item)
+    return "\n".join(format_user_guidance_item(item) for item in guidance_items)
+
+
+def get_user_guidance_items(state: dict, config: RunnableConfig) -> list[dict]:
+    """从状态和配置中读取结构化用户引导列表。"""
+    configurable = Configuration.from_runnable_config(config)
+    guidance_items = normalize_user_guidance_items(state.get("user_guidance", []))
+    if configurable.runtime_user_guidance:
+        existing_contents = {item["content"] for item in guidance_items}
+        if configurable.runtime_user_guidance not in existing_contents:
+            guidance_items.append(
+                normalize_user_guidance_item(
+                    {
+                        "content": configurable.runtime_user_guidance,
+                        "source": "config",
+                        "priority": 5,
+                        "applies_to": None,
+                        "status": "pending",
+                    }
+                )
+            )
+    return sorted(guidance_items, key=lambda item: item["priority"], reverse=True)
+
+
+def format_user_guidance_item(item: dict) -> str:
+    """把结构化用户引导格式化为适合提示词阅读的文本。"""
+    applies_to = item.get("applies_to") or "all"
+    return (
+        f"- [{item.get('status', 'pending')}; source={item.get('source', 'user')}; "
+        f"priority={item.get('priority', 0)}; applies_to={applies_to}] "
+        f"{item.get('content', '')}"
+    )
 
 async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Command[Literal["write_research_brief", "__end__"]]:
     """分析用户消息，并在研究范围不清晰时提出澄清问题。
@@ -218,7 +248,21 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
         max_concurrent_research_units=configurable.max_concurrent_research_units,
         max_researcher_iterations=configurable.max_researcher_iterations
     )
-    runtime_guidance = [configurable.runtime_user_guidance] if configurable.runtime_user_guidance else []
+    runtime_guidance = (
+        normalize_user_guidance_items(
+            [
+                {
+                    "content": configurable.runtime_user_guidance,
+                    "source": "config",
+                    "priority": 5,
+                    "applies_to": None,
+                    "status": "pending",
+                }
+            ]
+        )
+        if configurable.runtime_user_guidance
+        else []
+    )
     
     return Command(
         goto="research_supervisor", 
@@ -298,6 +342,33 @@ async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[
         )
     )
     response = await research_model.ainvoke(supervisor_messages + [runtime_context])
+    guidance_items = get_user_guidance_items(state, config)
+    supervisor_trace_events = build_trace_event(
+        config,
+        node="research_supervisor",
+        event_type="iteration",
+        summary="Supervisor planned the next research step.",
+        details={
+            "iteration": state.get("research_iterations", 0) + 1,
+            "tool_calls": [tool_call["name"] for tool_call in response.tool_calls],
+            "user_guidance": guidance_context,
+        },
+    )
+    if guidance_items:
+        supervisor_trace_events.extend(
+            build_trace_event(
+                config,
+                node="research_supervisor",
+                event_type="guidance_applied",
+                summary="Supervisor read runtime user guidance for this planning step.",
+                details={
+                    "guidance_ids": [item["id"] for item in guidance_items],
+                    "guidance_statuses": {
+                        item["id"]: item["status"] for item in guidance_items
+                    },
+                },
+            )
+        )
     
     # 第 3 步：更新状态并进入工具执行阶段
     return Command(
@@ -305,17 +376,7 @@ async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[
         update={
             "supervisor_messages": [response],
             "research_iterations": state.get("research_iterations", 0) + 1,
-            "trace_events": build_trace_event(
-                config,
-                node="research_supervisor",
-                event_type="iteration",
-                summary="Supervisor planned the next research step.",
-                details={
-                    "iteration": state.get("research_iterations", 0) + 1,
-                    "tool_calls": [tool_call["name"] for tool_call in response.tool_calls],
-                    "user_guidance": guidance_context,
-                },
-            ),
+            "trace_events": supervisor_trace_events,
             "node_status": build_node_status(
                 config,
                 node="research_supervisor",
