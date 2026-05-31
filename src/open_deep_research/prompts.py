@@ -162,9 +162,10 @@ research_system_prompt = """你是研究助手，正在针对用户输入主题�
 </Task>
 
 <Available Tools>
-你可以使用两个主要工具：
-1. **tavily_search**：执行网页搜索并收集信息
-2. **think_tool**：在研究过程中进行反思与策略规划
+你可以使用以下主要工具类型：
+1. **tavily_search / web_search**：用于发现线索、背景材料、新闻、公开网页和补充来源。
+2. **MCP tools**：如果配置中提供了领域专用 MCP 工具，用它们获取结构化数据、一手材料或高可信来源；应与搜索工具协同使用。
+3. **think_tool**：在研究过程中进行反思与策略规划。
 {mcp_prompt}
 
 **关键要求：每次搜索后都要使用 think_tool 反思结果并规划下一步。不要将 think_tool 与 tavily_search 或任何其他工具一起调用。think_tool 仅用于反思搜索结果。**

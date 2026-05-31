@@ -1,4 +1,5 @@
 from open_deep_research.deep_researcher import extract_source_lines_from_text
+from open_deep_research.domain_profiles import FINANCE_PROFILE_PROMPT
 from open_deep_research.prompts import (
     compress_research_system_prompt,
     final_report_generation_prompt,
@@ -42,6 +43,30 @@ def test_research_system_prompt_contains_profile_and_guidance_placeholders():
     )
     assert "使用金融研究标准。" in rendered
     assert "重点关注现金流。" in rendered
+
+
+def test_finance_profile_prompt_uses_search_and_mcp_collaboratively():
+    rendered = research_system_prompt.format(
+        date="2026-05-31",
+        domain_profile_prompt=FINANCE_PROFILE_PROMPT,
+        user_guidance_context="",
+        mcp_prompt="可用 MCP 工具由运行时配置提供。",
+    )
+
+    assert "协同工作" in rendered
+    assert "搜索发现线索" in rendered
+    assert "用 MCP 获取" in rendered
+    assert "应与搜索工具协同使用" in rendered
+    assert "Sources" in rendered
+    assert "来源标题" in rendered
+    assert "URL" in rendered
+    assert "来源机构" in rendered
+    assert "工具名" in rendered
+    assert "报告期" in rendered
+    assert "币种" in rendered
+    assert "口径" in rendered
+    assert "检索时间" in rendered
+    assert "evidence_items" not in rendered
 
 
 def test_final_report_prompt_contains_profile_and_guidance_placeholders():

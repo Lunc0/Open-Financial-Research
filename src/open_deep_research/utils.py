@@ -29,7 +29,7 @@ from langgraph.config import get_store
 from mcp import McpError
 from tavily import AsyncTavilyClient
 
-from open_deep_research.configuration import Configuration, SearchAPI
+from open_deep_research.configuration import Configuration, ResearchProfile, SearchAPI
 from open_deep_research.prompts import summarize_webpage_prompt
 from open_deep_research.state import ResearchComplete, Summary
 
@@ -528,6 +528,43 @@ async def load_mcp_tools(
 # 工具装配辅助函数
 ##########################
 
+
+def get_tool_name(available_tool: BaseTool | dict[str, Any]) -> str:
+    """返回工具名，并兼容模型提供方原生工具字典。"""
+    if hasattr(available_tool, "name"):
+        return available_tool.name
+    return available_tool.get("name", "web_search")
+
+
+def extend_tools_without_conflicts(
+    tools: list[BaseTool | dict[str, Any]],
+    incoming_tools: list[BaseTool | dict[str, Any]],
+) -> None:
+    """追加工具，同时跳过已经存在的工具名。"""
+    existing_tool_names = {get_tool_name(existing_tool) for existing_tool in tools}
+    for incoming_tool in incoming_tools:
+        incoming_tool_name = get_tool_name(incoming_tool)
+        if incoming_tool_name in existing_tool_names:
+            warnings.warn(
+                f"Tool '{incoming_tool_name}' conflicts with an existing tool name - skipping"
+            )
+            continue
+        tools.append(incoming_tool)
+        existing_tool_names.add(incoming_tool_name)
+
+
+async def load_mcp_tools_safely(
+    config: RunnableConfig,
+    existing_tool_names: set[str],
+) -> list[BaseTool]:
+    """加载 MCP 工具；失败时返回空列表以保留搜索兜底。"""
+    try:
+        return await load_mcp_tools(config, existing_tool_names)
+    except Exception as error:
+        warnings.warn(f"MCP tools could not be loaded - falling back to search tools: {error}")
+        return []
+
+
 async def get_search_tool(search_api: SearchAPI):
     """根据指定的 API 提供方配置并返回搜索工具。
     
@@ -577,22 +614,28 @@ async def get_all_tools(config: RunnableConfig):
     """
     # 先加入核心研究工具
     tools = [tool(ResearchComplete), think_tool]
-    
-    # 加入配置好的搜索工具
+
     configurable = Configuration.from_runnable_config(config)
+    research_profile = ResearchProfile(get_config_value(configurable.research_profile))
     search_api = SearchAPI(get_config_value(configurable.search_api))
     search_tools = await get_search_tool(search_api)
-    tools.extend(search_tools)
-    
-    # 记录现有工具名，防止命名冲突
-    existing_tool_names = {
-        tool.name if hasattr(tool, "name") else tool.get("name", "web_search") 
-        for tool in tools
-    }
-    
-    # 如有配置则加入 MCP 工具
-    mcp_tools = await load_mcp_tools(config, existing_tool_names)
-    tools.extend(mcp_tools)
+
+    if research_profile == ResearchProfile.FINANCE:
+        # 金融研究同时暴露 MCP 和通用搜索；保留 search 名称，避免 MCP 覆盖通用搜索工具。
+        existing_tool_names = {
+            get_tool_name(existing_tool)
+            for existing_tool in [*tools, *search_tools]
+        }
+        mcp_tools = await load_mcp_tools_safely(config, existing_tool_names)
+        extend_tools_without_conflicts(tools, search_tools)
+        extend_tools_without_conflicts(tools, mcp_tools)
+        return tools
+
+    # 通用研究保持原有行为：先通用搜索，再补充 MCP 工具。
+    extend_tools_without_conflicts(tools, search_tools)
+    existing_tool_names = {get_tool_name(existing_tool) for existing_tool in tools}
+    mcp_tools = await load_mcp_tools_safely(config, existing_tool_names)
+    extend_tools_without_conflicts(tools, mcp_tools)
     
     return tools
 
