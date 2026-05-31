@@ -1,6 +1,7 @@
 """Deep Research 智能体的主 LangGraph 实现。"""
 
 import asyncio
+import re
 from typing import Literal
 
 from langchain.chat_models import init_chat_model
@@ -67,6 +68,101 @@ configurable_model = init_chat_model(
     configurable_fields=("model", "max_tokens", "api_key"),
 )
 MAX_PENDING_GUIDANCE_COMPLETION_ATTEMPTS = 1
+MAX_SOURCE_LINES_IN_TRACE = 10
+MAX_SOURCE_LINE_LENGTH = 300
+SOURCE_PLACEHOLDER_PATTERNS = {
+    "未识别到可追溯来源",
+    "未识别到来源",
+    "无可追溯来源",
+    "没有可追溯来源",
+    "no traceable sources",
+    "no sources",
+    "no sources identified",
+}
+
+
+def is_source_section_heading(line: str) -> bool:
+    """判断一行是否是压缩研究结果中的来源段标题。"""
+    normalized_line = line.strip().strip("*").strip().rstrip(":：").lower()
+    if normalized_line.startswith("#"):
+        normalized_line = normalized_line.lstrip("#").strip().strip("*").strip().rstrip(":：").lower()
+    return normalized_line in {
+        "sources",
+        "source",
+        "references",
+        "reference",
+        "来源",
+        "参考来源",
+        "引用来源",
+        "资料来源",
+    }
+
+
+def is_likely_section_heading(line: str) -> bool:
+    """判断一行是否像新的 Markdown 小节标题。"""
+    stripped_line = line.strip()
+    if not stripped_line:
+        return False
+    if stripped_line.startswith(("-", "*", "+")):
+        return False
+    if re.match(r"^\d+[\.)]\s+", stripped_line):
+        return False
+    return stripped_line.startswith("#") or stripped_line.endswith((":", "："))
+
+
+def clean_source_line(line: str) -> str:
+    """清理单条来源行，并限制长度避免 trace 膨胀。"""
+    source_line = line.strip()
+    source_line = re.sub(r"^\s*[-*+]\s+", "", source_line)
+    source_line = re.sub(r"^\s*\d+[\.)]\s+", "", source_line)
+    source_line = source_line.strip()
+    if len(source_line) > MAX_SOURCE_LINE_LENGTH:
+        return f"{source_line[:MAX_SOURCE_LINE_LENGTH].rstrip()}..."
+    return source_line
+
+
+def is_placeholder_source_line(line: str) -> bool:
+    """判断来源行是否只是无来源占位说明。"""
+    normalized_line = line.strip().strip("-*+").strip().rstrip(".。").lower()
+    return normalized_line in SOURCE_PLACEHOLDER_PATTERNS
+
+
+def extract_source_lines_from_text(
+    text: str,
+    *,
+    max_sources: int = MAX_SOURCE_LINES_IN_TRACE,
+) -> list[str]:
+    """从压缩研究结果的 Sources 段提取短来源索引。"""
+    source_lines = []
+    seen_source_lines = set()
+    in_sources_section = False
+
+    for line in str(text or "").splitlines():
+        if is_source_section_heading(line):
+            in_sources_section = True
+            continue
+        if not in_sources_section:
+            continue
+
+        stripped_line = line.strip()
+        if not stripped_line:
+            continue
+        if is_likely_section_heading(stripped_line) and not is_source_section_heading(stripped_line):
+            break
+
+        source_line = clean_source_line(stripped_line)
+        if (
+            not source_line
+            or is_placeholder_source_line(source_line)
+            or source_line in seen_source_lines
+        ):
+            continue
+        source_lines.append(source_line)
+        seen_source_lines.add(source_line)
+        if len(source_lines) >= max_sources:
+            break
+
+    return source_lines
 
 
 def message_content_to_text(content) -> str:
@@ -1234,6 +1330,8 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
             
             # 执行压缩
             response = await synthesizer_model.ainvoke(messages)
+            compressed_research = str(response.content)
+            source_lines = extract_source_lines_from_text(compressed_research)
             
             # 从所有工具与 AI 消息中提取原始笔记
             raw_notes_content = "\n".join([
@@ -1243,7 +1341,7 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
             
             # 返回压缩成功结果
             return {
-                "compressed_research": str(response.content),
+                "compressed_research": compressed_research,
                 "raw_notes": [raw_notes_content],
                 "trace_events": build_trace_event(
                     config,
@@ -1252,8 +1350,10 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
                     summary="Compressed subtask findings.",
                     details={
                         "research_topic": state.get("research_topic", ""),
-                        "compressed_length": len(str(response.content)),
+                        "compressed_length": len(compressed_research),
                         "raw_notes_length": len(raw_notes_content),
+                        "source_count": len(source_lines),
+                        "sources": source_lines,
                     },
                 ),
                 "node_status": build_node_status(
@@ -1261,7 +1361,10 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
                     node="compress_research",
                     status="completed",
                     summary="Subtask findings compressed.",
-                    details={"research_topic": state.get("research_topic", "")},
+                    details={
+                        "research_topic": state.get("research_topic", ""),
+                        "source_count": len(source_lines),
+                    },
                 ),
             }
             
