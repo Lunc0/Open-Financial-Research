@@ -66,6 +66,8 @@ node_modules/
 IMPLEMENTATION_PHASE_PLAN.md
 progress.txt
 docs/research_enhancement_implementation.md
+docs/finance_state_flow.html
+docs/finance_state_flow_run.html
 
 # Temporary files
 tmp/

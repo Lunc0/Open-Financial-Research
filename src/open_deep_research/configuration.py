@@ -2,10 +2,13 @@
 
 import os
 from enum import Enum
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
+from dotenv import load_dotenv
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
+
+load_dotenv()
 
 
 class SearchAPI(Enum):
@@ -29,17 +32,67 @@ class MCPConfig(BaseModel):
         default=None,
         optional=True,
     )
-    """The URL of the MCP server"""
+    """The base URL or endpoint URL of a single MCP server."""
+    command: Optional[str] = Field(
+        default=None,
+        optional=True,
+    )
+    """Command for single-server stdio MCP configuration."""
+    args: Optional[List[str]] = Field(
+        default=None,
+        optional=True,
+    )
+    """Command arguments for single-server stdio MCP configuration."""
+    env: Optional[Dict[str, str]] = Field(
+        default=None,
+        optional=True,
+    )
+    """Environment variables for single-server stdio MCP configuration."""
+    cwd: Optional[str] = Field(
+        default=None,
+        optional=True,
+    )
+    """Working directory for single-server stdio MCP configuration."""
+    transport: Literal["streamable_http", "http", "sse", "stdio", "websocket"] = Field(
+        default="streamable_http",
+        optional=True,
+    )
+    """Transport for single-server MCP configuration."""
+    server_path: Optional[str] = Field(
+        default=None,
+        optional=True,
+    )
+    """Optional HTTP path to append when url is a base URL. Defaults to /mcp."""
+    headers: Optional[Dict[str, str]] = Field(
+        default=None,
+        optional=True,
+    )
+    """HTTP headers for HTTP/SSE MCP servers. Do not commit secrets in this field."""
+    access_token_env: Optional[str] = Field(
+        default=None,
+        optional=True,
+    )
+    """Environment variable name containing a bearer token for HTTP/SSE MCP auth."""
+    servers: Optional[Dict[str, Dict[str, Any]]] = Field(
+        default=None,
+        optional=True,
+    )
+    """Multi-server MCP connection config passed through to MultiServerMCPClient."""
     tools: Optional[List[str]] = Field(
         default=None,
         optional=True,
     )
-    """The tools to make available to the LLM"""
+    """Optional whitelist of MCP tools to make available to the LLM. Empty means all."""
     auth_required: Optional[bool] = Field(
         default=False,
         optional=True,
     )
     """Whether the MCP server requires authentication"""
+    tool_name_prefix: bool = Field(
+        default=False,
+        optional=True,
+    )
+    """Whether to ask the MCP adapter to prefix tool names with their server name."""
 
 class Configuration(BaseModel):
     """Main configuration class for the Deep Research agent."""
@@ -101,6 +154,55 @@ class Configuration(BaseModel):
                 "type": "boolean",
                 "default": True,
                 "description": "Whether to record node status and trace events for progress tracking and auditability.",
+            }
+        },
+    )
+    enable_sec_edgar_mcp: bool = Field(
+        default=False,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": False,
+                "description": "Automatically attach the free EdgarTools SEC EDGAR MCP server when using the finance profile.",
+            }
+        },
+    )
+    sec_edgar_identity_env: str = Field(
+        default="EDGAR_IDENTITY",
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": "EDGAR_IDENTITY",
+                "description": "Environment variable containing the SEC-required EDGAR identity string, e.g. 'Name email@example.com'.",
+            }
+        },
+    )
+    sec_edgar_mcp_command: str = Field(
+        default="uvx",
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": "uvx",
+                "description": "Command used to launch the local EdgarTools MCP server.",
+            }
+        },
+    )
+    sec_edgar_mcp_args: List[str] = Field(
+        default_factory=lambda: ["--from", "edgartools[ai]", "edgartools-mcp"],
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "description": "Arguments used to launch the local EdgarTools MCP server.",
+            }
+        },
+    )
+    sec_edgar_mcp_tools: Optional[List[str]] = Field(
+        default=None,
+        optional=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "description": "Optional whitelist of EdgarTools MCP tool names. Leave empty to expose all non-conflicting SEC EDGAR tools.",
             }
         },
     )

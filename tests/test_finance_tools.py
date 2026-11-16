@@ -1,7 +1,7 @@
 import pytest
 
 from open_deep_research import utils as research_utils
-from open_deep_research.configuration import ResearchProfile, SearchAPI
+from open_deep_research.configuration import Configuration, ResearchProfile, SearchAPI
 
 
 class FakeTool:
@@ -131,3 +131,170 @@ async def test_finance_profile_falls_back_to_search_when_mcp_load_fails(monkeypa
         })
 
     assert "web_search" in tool_names(tools)
+
+
+def test_build_mcp_server_config_does_not_append_mcp_twice(monkeypatch):
+    monkeypatch.setenv("FINANCE_MCP_TOKEN", "test-token")
+    configurable = Configuration.from_runnable_config({
+        "configurable": {
+            "mcp_config": {
+                "url": "http://localhost:8000/mcp",
+                "headers": {"X-Client": "open-deep-research"},
+                "access_token_env": "FINANCE_MCP_TOKEN",
+            }
+        }
+    })
+
+    server_config = research_utils.build_mcp_server_config(configurable.mcp_config)
+
+    assert server_config == {
+        "server_1": {
+            "transport": "streamable_http",
+            "url": "http://localhost:8000/mcp",
+            "headers": {
+                "X-Client": "open-deep-research",
+                "Authorization": "Bearer test-token",
+            },
+        }
+    }
+
+
+def test_build_mcp_server_config_supports_multi_server_configs():
+    configurable = Configuration.from_runnable_config({
+        "configurable": {
+            "mcp_config": {
+                "servers": {
+                    "filings": {
+                        "url": "https://finance.example.com",
+                        "transport": "http",
+                    },
+                    "local_macro": {
+                        "transport": "stdio",
+                        "command": "python",
+                        "args": ["server.py"],
+                    },
+                }
+            }
+        }
+    })
+
+    server_config = research_utils.build_mcp_server_config(configurable.mcp_config)
+
+    assert server_config["filings"]["transport"] == "streamable_http"
+    assert server_config["filings"]["url"] == "https://finance.example.com/mcp"
+    assert server_config["local_macro"] == {
+        "transport": "stdio",
+        "command": "python",
+        "args": ["server.py"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_load_mcp_tools_allows_empty_tool_whitelist(monkeypatch):
+    class FakeMCPClient:
+        last_connections = None
+        last_tool_name_prefix = None
+
+        def __init__(self, connections, *, tool_name_prefix=False):
+            self.__class__.last_connections = connections
+            self.__class__.last_tool_name_prefix = tool_name_prefix
+
+        async def get_tools(self):
+            return [FakeTool("finance_filings"), FakeTool("macro_data")]
+
+    monkeypatch.setattr(research_utils, "MultiServerMCPClient", FakeMCPClient)
+
+    tools = await research_utils.load_mcp_tools(
+        {
+            "configurable": {
+                "mcp_config": {
+                    "url": "http://localhost:8000",
+                    "tool_name_prefix": True,
+                }
+            }
+        },
+        existing_tool_names=set(),
+    )
+
+    assert tool_names(tools) == ["finance_filings", "macro_data"]
+    assert FakeMCPClient.last_connections["server_1"]["url"] == "http://localhost:8000/mcp"
+    assert FakeMCPClient.last_tool_name_prefix is True
+
+
+@pytest.mark.asyncio
+async def test_load_mcp_tools_still_filters_when_whitelist_is_configured(monkeypatch):
+    class FakeMCPClient:
+        def __init__(self, connections, *, tool_name_prefix=False):
+            pass
+
+        async def get_tools(self):
+            return [FakeTool("finance_filings"), FakeTool("macro_data")]
+
+    monkeypatch.setattr(research_utils, "MultiServerMCPClient", FakeMCPClient)
+
+    tools = await research_utils.load_mcp_tools(
+        {
+            "configurable": {
+                "mcp_config": {
+                    "url": "http://localhost:8000",
+                    "tools": ["macro_data"],
+                }
+            }
+        },
+        existing_tool_names=set(),
+    )
+
+    assert tool_names(tools) == ["macro_data"]
+
+
+@pytest.mark.asyncio
+async def test_finance_profile_can_auto_attach_sec_edgar_mcp(monkeypatch):
+    class FakeMCPClient:
+        last_connections = None
+
+        def __init__(self, connections, *, tool_name_prefix=False):
+            self.__class__.last_connections = connections
+
+        async def get_tools(self):
+            return [FakeTool("edgar_company"), FakeTool("edgar_search")]
+
+    monkeypatch.setenv("EDGAR_IDENTITY", "Open Deep Research tests test@example.com")
+    monkeypatch.setattr(research_utils, "MultiServerMCPClient", FakeMCPClient)
+
+    tools = await research_utils.load_mcp_tools(
+        {
+            "configurable": {
+                "research_profile": ResearchProfile.FINANCE.value,
+                "enable_sec_edgar_mcp": True,
+            }
+        },
+        existing_tool_names={"web_search"},
+    )
+
+    assert tool_names(tools) == ["edgar_company", "edgar_search"]
+    assert FakeMCPClient.last_connections == {
+        "server_1": {
+            "transport": "stdio",
+            "command": "uvx",
+            "args": ["--from", "edgartools[ai]", "edgartools-mcp"],
+            "env": {"EDGAR_IDENTITY": "Open Deep Research tests test@example.com"},
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_sec_edgar_mcp_requires_identity(monkeypatch):
+    monkeypatch.delenv("EDGAR_IDENTITY", raising=False)
+
+    with pytest.warns(UserWarning, match="EDGAR_IDENTITY is not set"):
+        tools = await research_utils.load_mcp_tools(
+            {
+                "configurable": {
+                    "research_profile": ResearchProfile.FINANCE.value,
+                    "enable_sec_edgar_mcp": True,
+                }
+            },
+            existing_tool_names=set(),
+        )
+
+    assert tools == []

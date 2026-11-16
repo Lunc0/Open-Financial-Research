@@ -6,6 +6,7 @@ import os
 import warnings
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Dict, List, Literal, Optional
+from urllib.parse import urlparse
 
 import aiohttp
 from langchain.chat_models import init_chat_model
@@ -20,7 +21,6 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import (
     BaseTool,
     InjectedToolArg,
-    StructuredTool,
     ToolException,
     tool,
 )
@@ -29,9 +29,17 @@ from langgraph.config import get_store
 from mcp import McpError
 from tavily import AsyncTavilyClient
 
-from open_deep_research.configuration import Configuration, ResearchProfile, SearchAPI
+from open_deep_research.configuration import (
+    Configuration,
+    MCPConfig,
+    ResearchProfile,
+    SearchAPI,
+)
 from open_deep_research.prompts import summarize_webpage_prompt
 from open_deep_research.state import ResearchComplete, Summary
+
+MCP_HTTP_TRANSPORTS = {"streamable_http", "http", "sse"}
+TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 
 ##########################
 # Tavily 搜索工具辅助函数
@@ -77,7 +85,7 @@ async def tavily_search(
     
     # 第 3 步：根据配置初始化摘要模型
     configurable = Configuration.from_runnable_config(config)
-    
+
     # 字符上限，用于控制在模型 token 限制内（可配置）
     max_char_to_include = configurable.max_content_length
     
@@ -370,6 +378,8 @@ async def fetch_tokens(config: RunnableConfig) -> dict[str, Any]:
     
     # 提取 MCP 配置
     mcp_config = config.get("configurable", {}).get("mcp_config")
+    if hasattr(mcp_config, "model_dump"):
+        mcp_config = mcp_config.model_dump()
     if not mcp_config or not mcp_config.get("url"):
         return None
     
@@ -382,7 +392,197 @@ async def fetch_tokens(config: RunnableConfig) -> dict[str, Any]:
     await set_tokens(config, mcp_tokens)
     return mcp_tokens
 
-def wrap_mcp_authenticate_tool(tool: StructuredTool) -> StructuredTool:
+
+def normalize_mcp_transport(transport: str | None) -> str:
+    """Normalize MCP transport aliases accepted by project configuration."""
+    normalized_transport = str(transport or "streamable_http")
+    if normalized_transport == "http":
+        return "streamable_http"
+    return normalized_transport
+
+
+def normalize_mcp_server_url(
+    raw_url: str,
+    *,
+    transport: str = "streamable_http",
+    server_path: str | None = None,
+) -> str:
+    """Build a usable MCP endpoint URL without appending /mcp twice."""
+    if transport not in MCP_HTTP_TRANSPORTS:
+        return raw_url
+
+    endpoint_path = server_path if server_path is not None else "/mcp"
+    if not endpoint_path:
+        return raw_url
+
+    parsed_url = urlparse(raw_url)
+    current_path = parsed_url.path.rstrip("/")
+    normalized_endpoint_path = endpoint_path if endpoint_path.startswith("/") else f"/{endpoint_path}"
+    normalized_endpoint_path = normalized_endpoint_path.rstrip("/")
+
+    if current_path and current_path != "/":
+        return raw_url.rstrip("/")
+    return raw_url.rstrip("/") + normalized_endpoint_path
+
+
+def build_mcp_headers(
+    configured_headers: dict[str, str] | None = None,
+    *,
+    access_token_env: str | None = None,
+    mcp_tokens: dict[str, Any] | None = None,
+) -> dict[str, str] | None:
+    """Merge static MCP headers with runtime bearer-token sources."""
+    headers = dict(configured_headers or {})
+    env_token = os.getenv(access_token_env) if access_token_env else None
+    access_token = env_token or (mcp_tokens or {}).get("access_token")
+    if access_token and "Authorization" not in headers:
+        headers["Authorization"] = f"Bearer {access_token}"
+    return headers or None
+
+
+def has_mcp_auth_material(
+    headers: dict[str, str] | None = None,
+    *,
+    access_token_env: str | None = None,
+    mcp_tokens: dict[str, Any] | None = None,
+) -> bool:
+    """Return whether MCP auth_required has usable auth material."""
+    if (mcp_tokens or {}).get("access_token"):
+        return True
+    if access_token_env and os.getenv(access_token_env):
+        return True
+    return bool((headers or {}).get("Authorization"))
+
+
+def has_mcp_config_auth_material(
+    mcp_config,
+    *,
+    mcp_tokens: dict[str, Any] | None = None,
+) -> bool:
+    """Return whether any configured MCP auth source is available."""
+    if has_mcp_auth_material(
+        mcp_config.headers,
+        access_token_env=mcp_config.access_token_env,
+        mcp_tokens=mcp_tokens,
+    ):
+        return True
+    for server_config in (mcp_config.servers or {}).values():
+        if not isinstance(server_config, dict):
+            continue
+        if has_mcp_auth_material(
+            server_config.get("headers"),
+            access_token_env=server_config.get("access_token_env"),
+            mcp_tokens=mcp_tokens,
+        ):
+            return True
+    return False
+
+
+def build_mcp_server_config(
+    mcp_config,
+    *,
+    mcp_tokens: dict[str, Any] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Build MultiServerMCPClient connection config from project MCP settings."""
+    if not mcp_config:
+        return {}
+
+    if mcp_config.servers:
+        server_config = {}
+        for server_name, raw_server_config in mcp_config.servers.items():
+            if not raw_server_config:
+                continue
+            server_entry = dict(raw_server_config)
+            if not server_entry.get("transport") and server_entry.get("command") and not server_entry.get("url"):
+                server_entry["transport"] = "stdio"
+            else:
+                server_entry["transport"] = normalize_mcp_transport(server_entry.get("transport"))
+            if "url" in server_entry:
+                server_entry["url"] = normalize_mcp_server_url(
+                    str(server_entry["url"]),
+                    transport=server_entry["transport"],
+                    server_path=server_entry.pop("server_path", None),
+                )
+                server_entry["headers"] = build_mcp_headers(
+                    server_entry.get("headers"),
+                    access_token_env=server_entry.pop("access_token_env", None),
+                    mcp_tokens=mcp_tokens,
+                )
+            server_config[str(server_name)] = {
+                key: value for key, value in server_entry.items() if value is not None
+            }
+        return server_config
+
+    if not mcp_config.url and not mcp_config.command:
+        return {}
+
+    transport = normalize_mcp_transport(mcp_config.transport)
+    if mcp_config.command and not mcp_config.url and transport == "streamable_http":
+        transport = "stdio"
+    server_entry: dict[str, Any] = {"transport": transport}
+    if transport == "stdio":
+        if not mcp_config.command:
+            return {}
+        server_entry["command"] = mcp_config.command
+        server_entry["args"] = mcp_config.args or []
+        server_entry["env"] = mcp_config.env
+        server_entry["cwd"] = mcp_config.cwd
+    else:
+        if not mcp_config.url:
+            return {}
+        server_entry["url"] = normalize_mcp_server_url(
+            mcp_config.url,
+            transport=transport,
+            server_path=mcp_config.server_path,
+        )
+        server_entry["headers"] = build_mcp_headers(
+            mcp_config.headers,
+            access_token_env=mcp_config.access_token_env,
+            mcp_tokens=mcp_tokens,
+        )
+    return {
+        "server_1": {
+            key: value for key, value in server_entry.items() if value is not None
+        }
+    }
+
+
+def env_flag_enabled(name: str) -> bool:
+    """Read a boolean feature flag from environment variables."""
+    return os.getenv(name, "").strip().lower() in TRUE_ENV_VALUES
+
+
+def get_effective_mcp_config(configurable: Configuration) -> MCPConfig | None:
+    """Return explicit MCP config or the optional default SEC EDGAR MCP config."""
+    if configurable.mcp_config:
+        return configurable.mcp_config
+
+    research_profile = ResearchProfile(get_config_value(configurable.research_profile))
+    sec_edgar_enabled = (
+        configurable.enable_sec_edgar_mcp
+        or env_flag_enabled("ENABLE_SEC_EDGAR_MCP")
+    )
+    if research_profile != ResearchProfile.FINANCE or not sec_edgar_enabled:
+        return None
+
+    edgar_identity = os.getenv(configurable.sec_edgar_identity_env)
+    if not edgar_identity:
+        warnings.warn(
+            "SEC EDGAR MCP is enabled but EDGAR_IDENTITY is not set; "
+            "skipping SEC EDGAR MCP tools."
+        )
+        return None
+
+    return MCPConfig(
+        transport="stdio",
+        command=configurable.sec_edgar_mcp_command,
+        args=configurable.sec_edgar_mcp_args,
+        env={configurable.sec_edgar_identity_env: edgar_identity},
+        tools=configurable.sec_edgar_mcp_tools,
+    )
+
+
+def wrap_mcp_authenticate_tool(tool: BaseTool) -> BaseTool:
     """为 MCP 工具包装认证与错误处理逻辑。
     
     参数:
@@ -391,7 +591,9 @@ def wrap_mcp_authenticate_tool(tool: StructuredTool) -> StructuredTool:
     返回:
         增强后的工具，包含认证错误处理能力
     """
-    original_coroutine = tool.coroutine
+    original_coroutine = getattr(tool, "coroutine", None)
+    if original_coroutine is None:
+        return tool
     
     async def authentication_wrapper(**kwargs):
         """带 MCP 错误处理和用户友好提示的增强协程。"""
@@ -460,44 +662,44 @@ async def load_mcp_tools(
         已配置完成、可直接使用的 MCP 工具列表
     """
     configurable = Configuration.from_runnable_config(config)
-    
+    mcp_config = get_effective_mcp_config(configurable)
+
     # 第 1 步：如有需要，先处理认证
-    if configurable.mcp_config and configurable.mcp_config.auth_required:
+    if mcp_config and mcp_config.auth_required:
         mcp_tokens = await fetch_tokens(config)
     else:
         mcp_tokens = None
     
     # 第 2 步：校验配置是否满足要求
-    config_valid = (
-        configurable.mcp_config and 
-        configurable.mcp_config.url and 
-        configurable.mcp_config.tools and 
-        (mcp_tokens or not configurable.mcp_config.auth_required)
-    )
+    config_valid = mcp_config is not None
     
     if not config_valid:
         return []
+
+    auth_valid = (
+        not mcp_config.auth_required
+        or has_mcp_config_auth_material(
+            mcp_config,
+            mcp_tokens=mcp_tokens,
+        )
+    )
+    if not auth_valid:
+        return []
     
     # 第 3 步：建立 MCP 服务器连接配置
-    server_url = configurable.mcp_config.url.rstrip("/") + "/mcp"
-    
-    # 若已拿到 token，则配置认证请求头
-    auth_headers = None
-    if mcp_tokens:
-        auth_headers = {"Authorization": f"Bearer {mcp_tokens['access_token']}"}
-    
-    mcp_server_config = {
-        "server_1": {
-            "url": server_url,
-            "headers": auth_headers,
-            "transport": "streamable_http"
-        }
-    }
-    # TODO: 等 OAP 合入多 MCP 服务器支持后，更新这里的实现
-    
+    mcp_server_config = build_mcp_server_config(
+        mcp_config,
+        mcp_tokens=mcp_tokens,
+    )
+    if not mcp_server_config:
+        return []
+
     # 第 4 步：从 MCP 服务器加载工具
     try:
-        client = MultiServerMCPClient(mcp_server_config)
+        client = MultiServerMCPClient(
+            mcp_server_config,
+            tool_name_prefix=mcp_config.tool_name_prefix,
+        )
         available_mcp_tools = await client.get_tools()
     except Exception:
         # MCP 服务器连接失败时返回空列表
@@ -505,6 +707,7 @@ async def load_mcp_tools(
     
     # 第 5 步：筛选并配置工具
     configured_tools = []
+    requested_tool_names = set(mcp_config.tools or [])
     for mcp_tool in available_mcp_tools:
         # 跳过名称冲突的工具
         if mcp_tool.name in existing_tool_names:
@@ -514,7 +717,7 @@ async def load_mcp_tools(
             continue
         
         # 仅保留配置中明确指定的工具
-        if mcp_tool.name not in set(configurable.mcp_config.tools):
+        if requested_tool_names and mcp_tool.name not in requested_tool_names:
             continue
         
         # 为工具包装认证处理后加入结果列表

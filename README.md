@@ -76,6 +76,70 @@ Open Deep Research supports a wide range of LLM providers via the [init_chat_mod
 
 Open Deep Research supports a wide range of search tools. By default it uses the [Tavily](https://www.tavily.com/) search API. Has full MCP compatibility and work native web search for Anthropic and OpenAI. See the `search_api` and `mcp_config` fields in the [configuration.py](https://github.com/langchain-ai/open_deep_research/blob/main/src/open_deep_research/configuration.py) file for more details. This can be accessed via the LangGraph Studio UI. 
 
+`mcp_config` supports both a simple single-server form and a pass-through multi-server form for `MultiServerMCPClient`.
+
+Single streamable HTTP server:
+
+```json
+{
+  "configurable": {
+    "mcp_config": {
+      "url": "https://your-mcp.example.com/mcp",
+      "transport": "streamable_http",
+      "tools": ["company_filings", "macro_data"],
+      "access_token_env": "FINANCE_MCP_TOKEN"
+    }
+  }
+}
+```
+
+Multi-server / stdio form:
+
+```json
+{
+  "configurable": {
+    "mcp_config": {
+      "tool_name_prefix": true,
+      "servers": {
+        "filings": {
+          "url": "https://your-mcp.example.com/mcp",
+          "transport": "streamable_http"
+        },
+        "local_macro": {
+          "transport": "stdio",
+          "command": "python",
+          "args": ["servers/macro_mcp.py"]
+        }
+      }
+    }
+  }
+}
+```
+
+If `tools` is omitted, all non-conflicting MCP tools are exposed. MCP tool names never override existing graph tools such as `web_search`.
+
+For finance research, this fork can auto-attach the free EdgarTools SEC EDGAR MCP server. It does not require an API key, but SEC requires automated clients to identify themselves:
+
+```dotenv
+ENABLE_SEC_EDGAR_MCP=true
+EDGAR_IDENTITY=Your Name your.email@example.com
+```
+
+When `research_profile=finance` and this flag is enabled, the graph launches:
+
+```json
+{
+  "transport": "stdio",
+  "command": "uvx",
+  "args": ["--from", "edgartools[ai]", "edgartools-mcp"],
+  "env": {
+    "EDGAR_IDENTITY": "Your Name your.email@example.com"
+  }
+}
+```
+
+The first run may download the EdgarTools MCP package through `uvx`. No SEC API key is used.
+
 #### Other 
 
 See the fields in the [configuration.py](https://github.com/langchain-ai/open_deep_research/blob/main/src/open_deep_research/configuration.py) for various other settings to customize the behavior of Open Deep Research. 
