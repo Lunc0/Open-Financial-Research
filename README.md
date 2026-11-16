@@ -1,29 +1,56 @@
-# 🔬 Open Deep Research
+# 🔬 Open Financial Research
 
 <img width="1388" height="298" alt="full_diagram" src="https://github.com/user-attachments/assets/12a2371b-8be2-4219-9b48-90503eb43c69" />
 
-Deep research has broken out as one of the most popular agent applications. This is a simple, configurable, fully open source deep research agent that works across many model providers, search tools, and MCP servers. It's performance is on par with many popular deep research agents ([see Deep Research Bench leaderboard](https://huggingface.co/spaces/Ayanami0730/DeepResearch-Leaderboard)).
+_The diagram above illustrates the inherited Open Deep Research graph architecture. This repository extends its state and control flow rather than replacing the core graph._
+
+Open Financial Research is a finance-oriented extension of [LangChain's Open Deep Research](https://github.com/langchain-ai/open_deep_research). It keeps the original configurable LangGraph research workflow while adding runtime user guidance, explicit research planning, structured traceability, finance-specific research behavior, and optional SEC EDGAR integration.
+
+The project is designed for long-running research where requirements may change after execution has started. Instead of treating a follow-up message as unstructured chat history, it turns the message into tracked guidance, maps it to an explicit plan change, binds researcher execution to plan items, and exposes the resulting state transitions to clients and UIs.
 
 <img width="817" height="666" alt="Screenshot 2025-07-13 at 11 21 12 PM" src="https://github.com/user-attachments/assets/052f2ed3-c664-4a4f-8ec2-074349dcaa3f" />
 
-### 🔥 Recent Updates
+_LangGraph Studio can be used to inspect graph state, including the added guidance, plan, trace-event, and node-status fields._
 
-**August 14, 2025**: See our free course [here](https://academy.langchain.com/courses/deep-research-with-langgraph) (and course repo [here](https://github.com/langchain-ai/deep_research_from_scratch)) on building open deep research.
+## ✨ Key Extensions
 
-**August 7, 2025**: Added GPT-5 and updated the Deep Research Bench evaluation w/ GPT-5 results.
+| Extension | What it adds |
+| --- | --- |
+| **Runtime guidance loop** | Users can add, revise, narrow, or redirect requirements while a research thread is running. Guidance remains `pending` until it is reflected in the research plan. |
+| **Explicit research plan** | Research work is represented by structured plan items with stable IDs, priorities, and lifecycle states. Every `ConductResearch` call must reference an executable plan item. |
+| **Structured traceability** | Append-only `trace_events` record what happened, while `node_status` exposes the latest status of each graph node for progress UIs and diagnostics. |
+| **Finance research profile** | Planning and report generation emphasize primary financial sources, metric/date/currency definitions, assumptions, risk scenarios, and auditability. |
+| **Search and MCP coordination** | General web search remains available alongside MCP tools, with conflict-safe tool loading and graceful search fallback. |
+| **SEC EDGAR integration** | Finance runs can optionally attach the free EdgarTools MCP server through `uvx`, without requiring an SEC API key. |
 
-**August 2, 2025**: Achieved #6 ranking on the [Deep Research Bench Leaderboard](https://huggingface.co/spaces/Ayanami0730/DeepResearch-Leaderboard) with an overall score of 0.4344. 
+The three central control mechanisms are documented in [Runtime Guidance, Explicit Planning, and Structured Traceability](docs/runtime_guidance_plan_traceability.md).
 
-**July 30, 2025**: Read about the evolution from our original implementations to the current version in our [blog post](https://rlancemartin.github.io/2025/07/30/bitter_lesson/).
+## 🔄 How the Control Loop Works
 
-**July 16, 2025**: Read more in our [blog](https://blog.langchain.com/open-deep-research/) and watch our [video](https://www.youtube.com/watch?v=agGiWUpxkhg) for a quick overview.
+```text
+User follow-up
+      │
+      ▼
+state.user_guidance (pending)
+      │
+      ▼ UpdateResearchPlan
+state.research_plan
+      │
+      ▼ ConductResearch(plan_item_id=...)
+Research execution
+      │
+      ├── trace_events: append-only history
+      └── node_status: latest progress snapshot
+```
 
-### 🚀 Quickstart
+The LLM interprets the request and proposes plan changes. Code-controlled reducers and validation apply those changes, reject invalid task delegation, prevent completion while guidance is still pending, and record the resulting events.
+
+## 🚀 Quickstart
 
 1. Clone the repository and activate a virtual environment:
 ```bash
-git clone https://github.com/langchain-ai/open_deep_research.git
-cd open_deep_research
+git clone https://github.com/Lunc0/Open-Financial-Research.git
+cd Open-Financial-Research
 uv venv
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 ```
@@ -38,6 +65,12 @@ uv pip install -r pyproject.toml
 3. Set up your `.env` file to customize the environment variables (for model selection, search tools, and other configuration settings):
 ```bash
 cp .env.example .env
+```
+
+On Windows PowerShell:
+
+```powershell
+Copy-Item .env.example .env
 ```
 
 4. Launch agent with the LangGraph server locally:
@@ -57,11 +90,11 @@ This will open the LangGraph Studio UI in your browser.
 
 Ask a question in the `messages` input field and click `Submit`. Select different configuration in the "Manage Assistants" tab.
 
-### ⚙️ Configurations
+## ⚙️ Configurations
 
 #### LLM :brain:
 
-Open Deep Research supports a wide range of LLM providers via the [init_chat_model() API](https://python.langchain.com/docs/how_to/chat_models_universal_init/). It uses LLMs for a few different tasks. See the below model fields in the [configuration.py](https://github.com/langchain-ai/open_deep_research/blob/main/src/open_deep_research/configuration.py) file for more details. This can be accessed via the LangGraph Studio UI. 
+Open Financial Research supports the model providers available through LangChain's [init_chat_model() API](https://python.langchain.com/docs/how_to/chat_models_universal_init/). It uses separate models for several stages. See [configuration.py](src/open_deep_research/configuration.py) for the complete configuration. These settings can also be changed through LangGraph Studio.
 
 - **Summarization** (default: `openai:gpt-4.1-mini`): Summarizes search API results
 - **Research** (default: `openai:gpt-4.1`): Power the search agent
@@ -74,7 +107,7 @@ Open Deep Research supports a wide range of LLM providers via the [init_chat_mod
 
 #### Search API :mag:
 
-Open Deep Research supports a wide range of search tools. By default it uses the [Tavily](https://www.tavily.com/) search API. Has full MCP compatibility and work native web search for Anthropic and OpenAI. See the `search_api` and `mcp_config` fields in the [configuration.py](https://github.com/langchain-ai/open_deep_research/blob/main/src/open_deep_research/configuration.py) file for more details. This can be accessed via the LangGraph Studio UI. 
+Open Financial Research supports Tavily, provider-native web search, and MCP tools. The `search_api` and `mcp_config` fields in [configuration.py](src/open_deep_research/configuration.py) control tool selection. In the finance profile, general web search and MCP tools can be exposed together so a specialized data source does not remove broad discovery and fallback search.
 
 `mcp_config` supports both a simple single-server form and a pass-through multi-server form for `MultiServerMCPClient`.
 
@@ -118,7 +151,7 @@ Multi-server / stdio form:
 
 If `tools` is omitted, all non-conflicting MCP tools are exposed. MCP tool names never override existing graph tools such as `web_search`.
 
-For finance research, this fork can auto-attach the free EdgarTools SEC EDGAR MCP server. It does not require an API key, but SEC requires automated clients to identify themselves:
+For finance research, the project can auto-attach the free EdgarTools SEC EDGAR MCP server. It does not require an API key, but SEC requires automated clients to identify themselves:
 
 ```dotenv
 ENABLE_SEC_EDGAR_MCP=true
@@ -142,21 +175,24 @@ The first run may download the EdgarTools MCP package through `uvx`. No SEC API 
 
 #### Other 
 
-See the fields in the [configuration.py](https://github.com/langchain-ai/open_deep_research/blob/main/src/open_deep_research/configuration.py) for various other settings to customize the behavior of Open Deep Research. 
+See [configuration.py](src/open_deep_research/configuration.py) for concurrency, model, search, MCP, finance profile, traceability, and report-generation settings.
 
-#### Domain profile, runtime guidance, and traceability
+#### Domain profile, runtime guidance, explicit planning, and traceability
 
-This fork adds three workflow controls for finance-oriented research and more transparent runs:
+This project adds the following workflow controls for finance-oriented research and more transparent runs:
 
 - `research_profile`: choose `general` or `finance`. The finance profile biases planning, source selection, evidence handling, and report writing toward primary financial sources, explicit metric/date/currency definitions, risk scenarios, assumptions, and auditability.
 - `state.user_guidance`: runtime guidance injected through graph state or checkpoint updates. Clients can append structured guidance while research is running to add or modify research direction before the next supervisor or researcher step.
 - `append_runtime_guidance`: service-layer helper for chat backends. When a user sends a message while a research thread is active, call this helper with the graph, thread config, and message content to append pending guidance into `state.user_guidance`.
 - LangGraph Studio Chat: after a research thread already has a `research_brief`, new user messages in the same thread are converted into pending `state.user_guidance` and routed back to the supervisor instead of rewriting the original brief.
+- `state.research_plan`: structured plan items track task identity, priority, origin, and status. `UpdateResearchPlan` applies explicit changes, and `ConductResearch` must reference a valid `pending` or `running` plan item.
 - `enable_traceability`: when enabled, the graph emits `trace_events` and `node_status` in state. UIs can stream or inspect these fields to show what each node is doing, which tools were called, which subtopics were delegated, and why a phase stopped.
 
-### 📊 Evaluation
+See the [mechanism design document](docs/runtime_guidance_plan_traceability.md) for reducers, state transitions, completion guards, failure handling, and an end-to-end example.
 
-Open Deep Research is configured for evaluation with [Deep Research Bench](https://huggingface.co/spaces/Ayanami0730/DeepResearch-Leaderboard). This benchmark has 100 PhD-level research tasks (50 English, 50 Chinese), crafted by domain experts across 22 fields (e.g., Science & Tech, Business & Finance) to mirror real-world deep-research needs. It has 2 evaluation metrics, but the leaderboard is based on the RACE score. This uses LLM-as-a-judge (Gemini) to evaluate research reports against a golden set of reports compiled by experts across a set of metrics.
+## 📊 Evaluation
+
+The inherited evaluation tooling supports [Deep Research Bench](https://huggingface.co/spaces/Ayanami0730/DeepResearch-Leaderboard). The benchmark contains 100 research tasks across multiple fields and uses LLM-based evaluation against reference reports. The results below are upstream Open Deep Research results; they are retained as a baseline and should not be interpreted as measurements of this finance-oriented fork.
 
 #### Usage
 
@@ -177,7 +213,7 @@ python tests/extract_langsmith_data.py --project-name "YOUR_EXPERIMENT_NAME" --m
 
 This creates `tests/expt_results/deep_research_bench_model-name.jsonl` with the required format. Move the generated JSONL file to a local clone of the Deep Research Bench repository and follow their [Quick Start guide](https://github.com/Ayanami0730/deep_research_bench?tab=readme-ov-file#quick-start) for evaluation submission.
 
-#### Results 
+#### Upstream baseline results
 
 | Name | Commit | Summarization | Research | Compression | Total Cost | Total Tokens | RACE Score | Experiment |
 |------|--------|---------------|----------|-------------|------------|--------------|------------|------------|
@@ -186,7 +222,7 @@ This creates `tests/expt_results/deep_research_bench_model-name.jsonl` with the 
 | Claude Sonnet 4 | [f877ea9](https://github.com/langchain-ai/open_deep_research/pull/163/commits/f877ea93641680879c420ea991e998b47aab9bcc) | openai:gpt-4.1-mini | anthropic:claude-sonnet-4-20250514 | openai:gpt-4.1 | $187.09 | 138,917,050 | 0.4401 | [Link](https://smith.langchain.com/o/ebbaf2eb-769b-4505-aca2-d11de10372a4/datasets/6e4766ca-6[…]ons=04f6002d-6080-4759-bcf5-9a52e57449ea&baseline=undefined) |
 | Deep Research Bench Submission | [c0a160b](https://github.com/langchain-ai/open_deep_research/commit/c0a160b57a9b5ecd4b8217c3811a14d8eff97f72) | openai:gpt-4.1-nano | openai:gpt-4.1 | openai:gpt-4.1 | $87.83 | 207,005,549 | 0.4344 | [Link](https://smith.langchain.com/o/ebbaf2eb-769b-4505-aca2-d11de10372a4/datasets/6e4766ca-6[…]ons=e6647f74-ad2f-4cb9-887e-acb38b5f73c0&baseline=undefined) |
 
-### 🚀 Deployments and Usage
+## 🚀 Deployments and Usage
 
 #### LangGraph Studio
 
@@ -200,13 +236,13 @@ You can easily deploy to [LangGraph Platform](https://langchain-ai.github.io/lan
 
 Open Agent Platform (OAP) is a UI from which non-technical users can build and configure their own agents. OAP is great for allowing users to configure the Deep Researcher with different MCP tools and search APIs that are best suited to their needs and the problems that they want to solve.
 
-We've deployed Open Deep Research to our public demo instance of OAP. All you need to do is add your API Keys, and you can test out the Deep Researcher for yourself! Try it out [here](https://oap.langchain.com)
+The upstream Open Deep Research project is available in the public OAP demo. This repository can also be deployed to your own compatible LangGraph or OAP environment.
 
 You can also deploy your own instance of OAP, and make your own custom agents (like Deep Researcher) available on it to your users.
 1. [Deploy Open Agent Platform](https://docs.oap.langchain.com/quickstart)
 2. [Add Deep Researcher to OAP](https://docs.oap.langchain.com/setup/agents)
 
-### Legacy Implementations 🏛️
+## Legacy Implementations 🏛️
 
 The `src/legacy/` folder contains two earlier implementations that provide alternative approaches to automated research. They are less performant than the current implementation, but provide alternative ideas understanding the different approaches to deep research.
 
@@ -221,3 +257,9 @@ The `src/legacy/` folder contains two earlier implementations that provide alter
 - **Parallel Processing**: Multiple researchers work simultaneously
 - **Speed Optimized**: Faster report generation through concurrency
 - **MCP Support**: Extensive Model Context Protocol integration
+
+## 🙏 Upstream and License
+
+Open Financial Research is based on [langchain-ai/open_deep_research](https://github.com/langchain-ai/open_deep_research). The original graph architecture, provider integrations, evaluation tooling, and legacy implementations come from that project. This repository adds the finance-oriented behavior and control mechanisms described above.
+
+The project remains available under the [MIT License](LICENSE). Please retain the existing license and attribution when redistributing derived work.
